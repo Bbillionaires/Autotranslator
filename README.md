@@ -7,9 +7,12 @@ contacts in their own language without anyone doing the translation by hand.
 
 This repository is being built in phases against
 [`docs/implementation-plan.md`](./docs/implementation-plan.md), the governing architecture
-document. **This README currently reflects Phase 3 ("Foundation")** — the Next.js app
-scaffold, database schema, auth, logging, error handling, and base navigation shell. Later
-phases add the translation engine, the messaging core, and each channel adapter.
+document. **This README reflects the MVP through Phase 9** — Telegram and Android SMS are
+fully implemented, WhatsApp Business Cloud API is implemented gated behind
+`WHATSAPP_ENABLED`, the full shared-inbox UI (Phase 7) is in place, and a subsequent
+security/completeness review pass (see `docs/review-report.md`) added security headers,
+broader rate limiting, user management, an internal retry-worker endpoint, and Android
+device-management UI on top of that.
 
 ## Product overview
 
@@ -202,6 +205,56 @@ validation and the GET-verify subscription handshake. With `WHATSAPP_ENABLED` un
 Meta-side setup checklist (Business Manager account, App Review/Business Verification,
 obtaining credentials, registering the webhook, and message-template approval) — none of
 which this codebase can perform on your behalf.
+
+## Scheduling the retry worker in production
+
+Automatic retry/backoff for transient send failures (`src/server/messaging/retryQueue.ts`'s
+`runRetryWorkerOnce`) is driven by `GET`/`POST /api/internal/retry-worker`, which is **not**
+invoked automatically by anything inside the app — you must schedule an external caller to
+hit it periodically (every 1–5 minutes is reasonable), or `FAILED` messages will only ever
+be retried when a human clicks "Retry" in the inbox UI.
+
+1. Set `INTERNAL_WORKER_SECRET` (generate one with `openssl rand -hex 32`) — the route
+   refuses to run at all (`503`) if this is unset, and rejects (`401`) any request whose
+   `X-Internal-Worker-Secret` header doesn't match.
+2. Point a scheduler at it:
+
+   **Vercel Cron** (`vercel.json`):
+
+   ```json
+   {
+     "crons": [{ "path": "/api/internal/retry-worker", "schedule": "*/5 * * * *" }]
+   }
+   ```
+
+   Vercel Cron sends a `GET` with no custom headers by default — if you need the shared
+   secret enforced on Vercel, use a Vercel Cron Job that's configured to include a custom
+   header, or front it with a lightweight wrapper. Simplest self-hosted alternative below
+   avoids this entirely since you control the request.
+
+   **Self-hosted (systemd timer / plain cron)**:
+
+   ```cron
+   */5 * * * * curl -fsS -X POST https://app.example.com/api/internal/retry-worker \
+     -H "X-Internal-Worker-Secret: $INTERNAL_WORKER_SECRET"
+   ```
+
+   **Self-hosted (`node-cron`, if you'd rather run it in-process alongside the app)**:
+
+   ```ts
+   import cron from "node-cron";
+   cron.schedule("*/5 * * * *", () => {
+     fetch(`${process.env.APP_URL}/api/internal/retry-worker`, {
+       method: "POST",
+       headers: { "X-Internal-Worker-Secret": process.env.INTERNAL_WORKER_SECRET! },
+     }).catch((err) => console.error("retry-worker cron call failed", err));
+   });
+   ```
+
+   (`node-cron` isn't a dependency of this repo — add it if you choose this option.)
+
+The route processes every organization's due `FAILED` messages in one pass and returns
+`{ ok: true, attempted, succeeded, failed }`.
 
 ## Multi-tenancy, security, and architecture notes
 

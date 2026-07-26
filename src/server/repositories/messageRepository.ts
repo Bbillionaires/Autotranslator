@@ -134,6 +134,30 @@ export const messageRepository = {
   },
 
   /**
+   * Cross-org variant of `listFailedAwaitingRetry` above — the H4 fix's one legitimate
+   * exception to "every repository function takes the caller's organizationId" (same
+   * precedent as `channelAccountRepository.findFirstActiveByChannelTypeInOtherOrg`/`findById`).
+   * Used ONLY by `GET/POST /api/internal/retry-worker` (`src/app/api/internal/retry-worker/
+   * route.ts`), which is not a per-org session request — it's an internal, shared-secret
+   * protected endpoint an external scheduler hits periodically to drive automatic retries
+   * for EVERY organization in one pass (per docs/implementation-plan.md §3.6 step 8's
+   * "automatic retry/backoff" requirement, which was previously never actually invoked at
+   * runtime — see H4 in docs/review-report.md). Each returned row still carries its own
+   * `organizationId`, so the caller re-derives org-scoping per message before calling
+   * `outboundService.retryMessage(organizationId, messageId, ...)` — this method itself
+   * never bypasses org-scoping for the actual retry/send call, only for the initial
+   * "what's due" query.
+   */
+  async listAllFailedAwaitingRetryAcrossOrgs(
+    client: PrismaClientOrTx = prisma,
+  ): Promise<Array<Prisma.MessageGetPayload<{ include: { events: true } }>>> {
+    return client.message.findMany({
+      where: { status: "FAILED", isInternalNote: false },
+      include: { events: { where: { eventType: "retry_scheduled" }, orderBy: { createdAt: "desc" } } },
+    });
+  },
+
+  /**
    * `GET /api/gateways/messages/pending`, per docs/implementation-plan.md §5/Phase 8: the
    * outbound messages a specific Android gateway device (`channelAccountId`) should pick up
    * next. Scoped by BOTH `organizationId` AND `conversation.channelAccountId` so one org's

@@ -68,6 +68,14 @@ const rawEnvSchema = z.object({
   WHATSAPP_BUSINESS_ACCOUNT_ID: z.string().optional(),
   WHATSAPP_VERIFY_TOKEN: z.string().optional(),
   WHATSAPP_APP_SECRET: z.string().optional(),
+
+  // ---- Internal retry worker (H4 fix, docs/review-report.md) ----
+  // Optional-but-recommended: protects GET/POST /api/internal/retry-worker (the endpoint an
+  // external scheduler hits periodically to drive automatic message retries) with a
+  // shared-secret header check. Never required for boot (this endpoint is opt-in
+  // infrastructure, not a core feature flag) — if unset, the route itself refuses to run
+  // rather than operating unauthenticated (see that route's doc comment).
+  INTERNAL_WORKER_SECRET: z.string().optional(),
 });
 
 type RawEnv = z.infer<typeof rawEnvSchema>;

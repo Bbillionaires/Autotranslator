@@ -18,12 +18,10 @@
  * device" shortcut).
  */
 import { auth } from "@/server/auth";
-import { isUniqueConstraintViolation } from "@/server/db";
-import { ConflictError, handleRouteError, ValidationError } from "@/server/errors";
-import { issueDeviceToken, hashDeviceToken } from "@/server/gateways/androidAuth";
-import { normalizePhoneNumber } from "@/server/channels/androidSms/parse";
-import { channelAccountRepository } from "@/server/repositories/channelAccountRepository";
+import { handleRouteError, ValidationError } from "@/server/errors";
+import { registerAndroidDevice } from "@/server/gateways/deviceRegistration";
 import { gatewayRegisterRateLimiter, rateLimitedResponse } from "@/server/rateLimit";
+import { auditLogRepository } from "@/server/repositories/auditLogRepository";
 import { requireRole } from "@/server/roles";
 import { registerDeviceSchema } from "@/server/validation/androidGateway";
 
@@ -50,32 +48,22 @@ export async function POST(req: Request): Promise<Response> {
       return handleRouteError(new ValidationError("Invalid device registration payload.", parsed.error.flatten()));
     }
 
-    const phoneNumber = normalizePhoneNumber(parsed.data.phoneNumber);
+    const { deviceId, deviceToken } = await registerAndroidDevice(organizationId, parsed.data);
 
-    let channelAccount;
-    try {
-      channelAccount = await channelAccountRepository.create(organizationId, {
-        channelType: "ANDROID_SMS",
-        displayName: parsed.data.deviceName,
-        externalAccountId: phoneNumber,
-        status: "ACTIVE",
-      });
-    } catch (error) {
-      if (isUniqueConstraintViolation(error)) {
-        throw new ConflictError("A device is already registered for this phone number in this organization.", {
-          phoneNumber,
-        });
-      }
-      throw error;
-    }
-
-    const token = issueDeviceToken(channelAccount.id);
-    await channelAccountRepository.setDeviceTokenHash(organizationId, channelAccount.id, hashDeviceToken(token));
+    // M1 fix (docs/review-report.md): channel account connect/device registration is now audit-logged.
+    await auditLogRepository.record({
+      organizationId,
+      userId: session!.user.id,
+      action: "channel_account.connected",
+      entityType: "ChannelAccount",
+      entityId: deviceId,
+      metadata: { channelType: "ANDROID_SMS", displayName: parsed.data.deviceName },
+    });
 
     return Response.json(
       {
-        deviceId: channelAccount.id,
-        deviceToken: token,
+        deviceId,
+        deviceToken,
         message: "Store this token securely on the device now — it will not be shown again.",
       },
       { status: 201 },

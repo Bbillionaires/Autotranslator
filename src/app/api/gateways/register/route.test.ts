@@ -15,8 +15,18 @@ vi.mock("@/server/auth", () => ({ auth: vi.fn(async (): Promise<import("next-aut
 const auth = (await import("@/server/auth")).auth as unknown as () => Promise<Session | null>;
 const { prisma } = await import("@/server/db");
 const { organizationRepository } = await import("@/server/repositories/organizationRepository");
+const { userRepository } = await import("@/server/repositories/userRepository");
 const { gatewayRegisterRateLimiter } = await import("@/server/rateLimit");
 const { POST } = await import("./route");
+
+async function createAdminUser(organizationId: string) {
+  return userRepository.create({
+    organizationId,
+    name: "Test Admin",
+    email: `admin-${Date.now()}-${Math.random()}@test.dev`,
+    role: "ADMINISTRATOR",
+  });
+}
 
 function fakeSession(role: Session["user"]["role"], organizationId: string, userId = "u1"): Session {
   return { user: { id: userId, organizationId, role }, expires: "" } as Session;
@@ -72,7 +82,8 @@ describe("POST /api/gateways/register — happy path", () => {
   it("creates an ACTIVE ANDROID_SMS ChannelAccount and returns a token exactly once", async () => {
     const organization = await organizationRepository.create({ name: `Register Test Org ${Date.now()}-${Math.random()}` });
     organizationId = organization.id;
-    vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId));
+    const admin = await createAdminUser(organizationId);
+    vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId, admin.id));
 
     const res = await POST(buildRequest({ deviceName: "Front desk phone", phoneNumber: "+1 (555) 123-9999" }));
     expect(res.status).toBe(201);
@@ -87,12 +98,18 @@ describe("POST /api/gateways/register — happy path", () => {
     expect(channelAccount.deviceTokenHash).not.toBeNull();
     // The raw token is never persisted anywhere on the row.
     expect(JSON.stringify(channelAccount)).not.toContain(body.deviceToken);
+
+    // M1: device registration (channel account connect) is audit-logged.
+    const auditRows = await prisma.auditLog.findMany({ where: { organizationId, entityId: body.deviceId } });
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0].action).toBe("channel_account.connected");
   });
 
   it("rejects a malformed payload with 400", async () => {
     const organization = await organizationRepository.create({ name: `Register Bad Payload Org ${Date.now()}-${Math.random()}` });
     organizationId = organization.id;
-    vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId));
+    const admin = await createAdminUser(organizationId);
+    vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId, admin.id));
 
     const res = await POST(buildRequest({ deviceName: "" }));
     expect(res.status).toBe(400);
@@ -101,7 +118,8 @@ describe("POST /api/gateways/register — happy path", () => {
   it("rejects re-registering the same phone number in the same org with a conflict", async () => {
     const organization = await organizationRepository.create({ name: `Register Dup Org ${Date.now()}-${Math.random()}` });
     organizationId = organization.id;
-    vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId));
+    const admin = await createAdminUser(organizationId);
+    vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId, admin.id));
 
     const first = await POST(buildRequest({ deviceName: "Phone A", phoneNumber: "+15559990000" }));
     expect(first.status).toBe(201);
@@ -113,7 +131,8 @@ describe("POST /api/gateways/register — happy path", () => {
   it("supports multiple distinct devices in the same org (no 'the one device' shortcut)", async () => {
     const organization = await organizationRepository.create({ name: `Register Multi Device Org ${Date.now()}-${Math.random()}` });
     organizationId = organization.id;
-    vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId));
+    const admin = await createAdminUser(organizationId);
+    vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId, admin.id));
 
     const first = await POST(buildRequest({ deviceName: "Phone A", phoneNumber: "+15551110001" }));
     const second = await POST(buildRequest({ deviceName: "Phone B", phoneNumber: "+15551110002" }));

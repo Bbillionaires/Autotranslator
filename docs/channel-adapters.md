@@ -201,10 +201,10 @@ foreground service, battery optimization, retry behavior, privacy disclosure).
 An admin revokes a device by setting `ChannelAccount.revokedAt` (`channelAccountRepository.revokeDevice`).
 Every subsequent request from that device's token is rejected with a bare `401` immediately —
 no need to rotate `ANDROID_GATEWAY_SIGNING_SECRET`, which would invalidate every other
-device's token too. There is currently no dedicated Server Action/UI button for this (a
-documented gap, see "Known limitations" below) — it's reachable today via
-`channelAccountRepository.revokeDevice(organizationId, channelAccountId)` or direct DB
-access; wiring a Settings UI button is a natural, low-risk follow-up.
+device's token too. Reachable via Settings → Channel integrations → Android SMS gateway's
+"Revoke" button (`revokeAndroidDevice` Server Action, Session+Role(Administrator+),
+audit-logged), or directly via `channelAccountRepository.revokeDevice(organizationId,
+channelAccountId)`.
 
 ### API contract — authentication
 
@@ -371,10 +371,12 @@ Response `200`:
 
 ### Known limitations (documented, not hidden)
 
-- **No dedicated revoke Server Action/UI button yet.** `channelAccountRepository.revokeDevice`
-  exists and is fully wired into `authenticateDevice`'s check, but nothing in the Settings UI
-  calls it yet — a natural, low-risk Phase-10-or-later follow-up (list registered devices,
-  show last-heartbeat/health, add a "Revoke" button).
+- ~~No dedicated revoke Server Action/UI button yet.~~ **Fixed (H6/M5, docs/review-report.md):**
+  `revokeAndroidDevice` (`src/server/actions/android.ts`, Session+Role(Administrator+),
+  audit-logged) wraps `channelAccountRepository.revokeDevice`, and Settings → Channel
+  integrations → Android SMS gateway (`src/app/(app)/settings/android-section.tsx`) now
+  shows the device list (health/heartbeat status), a register form (device token shown
+  once), and a "Revoke" button per device — no more direct-DB-only path.
 - **Deterministic, non-rotatable per-device token.** The token is `HMAC(deviceId, secret)` —
   the same deviceId always signs to the same token given the same secret. This is
   intentional (per the plan's §6.3 design: revocation is via `revokedAt`, not token
