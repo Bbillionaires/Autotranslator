@@ -83,10 +83,19 @@ export function nextRetryDecision(
  * escaped via an explicit manual retry (moves back to `PENDING`) — never automatically.
  * `DELIVERED -> PENDING` is deliberately absent: once a channel has confirmed delivery, the
  * message can only move forward to `READ`, never back to an unsent state.
+ *
+ * `PENDING -> QUEUED` and `QUEUED -> SENT` (Phase 8): the Android SMS gateway's inverted
+ * control flow (§3.2/§3.6) means `outboundService.confirmAndSend` transitions a freshly
+ * translated `PENDING` message straight to `QUEUED` (not `SENT`) when `AndroidSmsAdapter`
+ * reports `status: "QUEUED"` — the row only reaches `SENT` later, when the device calls
+ * `POST /api/gateways/messages/:id/acknowledge`. `QUEUED -> FAILED` already existed (a
+ * message can fail before ever being picked up by a device, e.g. a revoked device); the
+ * device's `POST /api/gateways/messages/:id/fail` reuses that same transition via
+ * `outboundService.handleSendFailure`.
  */
 const VALID_TRANSITIONS: Record<MessageStatus, readonly MessageStatus[]> = {
-  QUEUED: ["PENDING", "FAILED"],
-  PENDING: ["SENT", "FAILED"],
+  QUEUED: ["PENDING", "SENT", "FAILED"],
+  PENDING: ["SENT", "QUEUED", "FAILED"],
   SENT: ["DELIVERED", "FAILED"],
   DELIVERED: ["READ"],
   READ: [],

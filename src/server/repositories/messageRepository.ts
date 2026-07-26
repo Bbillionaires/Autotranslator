@@ -119,4 +119,55 @@ export const messageRepository = {
       include: { events: { where: { eventType: "retry_scheduled" }, orderBy: { createdAt: "desc" } } },
     });
   },
+
+  /**
+   * `GET /api/gateways/messages/pending`, per docs/implementation-plan.md §5/Phase 8: the
+   * outbound messages a specific Android gateway device (`channelAccountId`) should pick up
+   * next. Scoped by BOTH `organizationId` AND `conversation.channelAccountId` so one org's
+   * (or one device's) pending queue never leaks another's — a device only ever sees
+   * messages queued for conversations that belong to its own `ChannelAccount` row.
+   * Oldest-first (`createdAt: "asc"`) so a device that's been offline drains its backlog in
+   * send order once it reconnects; `take` is capped by the caller (route handler) to a
+   * reasonable page size.
+   */
+  async listQueuedForChannelAccount(
+    organizationId: string,
+    channelAccountId: string,
+    options: { take?: number } = {},
+    client: PrismaClientOrTx = prisma,
+  ) {
+    return client.message.findMany({
+      where: {
+        organizationId,
+        status: "QUEUED",
+        direction: "OUTBOUND",
+        isInternalNote: false,
+        conversation: { channelAccountId },
+      },
+      orderBy: { createdAt: "asc" },
+      take: Math.min(options.take ?? 50, 100),
+      include: { conversation: { include: { contact: true } } },
+    });
+  },
+
+  /**
+   * Loads a `Message` for a gateway acknowledge/fail call, verifying it belongs to the
+   * calling device's own `ChannelAccount` (via its conversation) — not just the same
+   * organization. Multiple Android devices can share an org (Phase 8 deliverable #7: no
+   * "the one device" shortcut), so org-scoping alone isn't enough to stop one device from
+   * acknowledging/failing another device's queued message; this is the device-isolation
+   * check both `/acknowledge` and `/fail` rely on. Returns `null` (not a thrown error) when
+   * the message doesn't belong to this device, so callers can return a uniform 404 without
+   * leaking whether the id exists at all under a different device.
+   */
+  async findForChannelAccountOrNull(
+    organizationId: string,
+    channelAccountId: string,
+    messageId: string,
+    client: PrismaClientOrTx = prisma,
+  ) {
+    return client.message.findFirst({
+      where: { id: messageId, organizationId, conversation: { channelAccountId } },
+    });
+  },
 };

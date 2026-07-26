@@ -22,7 +22,14 @@ export type MessageEventType =
   | "dead_letter"
   | "duplicate_webhook_ignored"
   | "internal_note_added"
-  | "translation_edited";
+  | "translation_edited"
+  // Phase 8 (Android SMS gateway): the adapter accepted the message for device pickup
+  // (`AndroidSmsAdapter.sendMessage` returning `status: "QUEUED"`) — distinct from "sent"
+  // since the channel hasn't actually transmitted it yet, only queued it.
+  | "queued_for_pickup"
+  // Phase 8: the device confirmed it actually sent the SMS
+  // (`POST /api/gateways/messages/:id/acknowledge`).
+  | "device_acknowledged";
 
 export interface CreateMessageEventInput {
   messageId: string;

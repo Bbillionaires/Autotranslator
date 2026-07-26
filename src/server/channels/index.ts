@@ -4,10 +4,6 @@
  * This is the extension point later phases hook into. Import and call `registerChannelAdapters()`
  * once at app boot (e.g. from a Next.js instrumentation hook).
  *
- *   // Phase 8:
- *   import { AndroidSmsAdapter } from "./android";
- *   if (env.ANDROID_GATEWAY_ENABLED) channelAdapterRegistry.register(new AndroidSmsAdapter());
- *
  *   // Phase 9:
  *   import { WhatsAppAdapter } from "./whatsapp";
  *   if (env.WHATSAPP_ENABLED) channelAdapterRegistry.register(new WhatsAppAdapter());
@@ -18,6 +14,7 @@
  * instead of going through the registry at all.
  */
 import { env } from "../env";
+import { AndroidSmsAdapter } from "./androidSms/adapter";
 import { channelAdapterRegistry } from "./registry";
 import { TelegramAdapter } from "./telegram/adapter";
 
@@ -30,11 +27,14 @@ export * from "./types";
  * being registered, so a repeated call (e.g. from a hot-reloaded dev server) is a no-op
  * rather than a `ConflictError`.
  *
- * Phase 8/9 add their `if (env.X_ENABLED) channelAdapterRegistry.register(new XAdapter())`
- * calls here, following the exact same guarded pattern as Telegram below.
+ * Phase 9 adds its `if (env.WHATSAPP_ENABLED) channelAdapterRegistry.register(new WhatsAppAdapter())`
+ * call here, following the exact same guarded pattern as Telegram/Android below.
  */
 export function registerChannelAdapters(): void {
   if (env.TELEGRAM_ENABLED && !channelAdapterRegistry.has("TELEGRAM")) {
     channelAdapterRegistry.register(new TelegramAdapter());
+  }
+  if (env.ANDROID_GATEWAY_ENABLED && !channelAdapterRegistry.has("ANDROID_SMS")) {
+    channelAdapterRegistry.register(new AndroidSmsAdapter());
   }
 }

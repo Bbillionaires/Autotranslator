@@ -44,7 +44,14 @@ export interface SendMessageParams {
   reviewBeforeSend?: boolean;
 }
 
-export type SendMessageOutcome = "DRAFT" | "SENT" | "FAILED";
+/**
+ * "QUEUED" (Phase 8) is distinct from "DRAFT": a `QUEUED` message has already been sent to
+ * (accepted by) its channel adapter and is durably out of the compose form's hands — it's
+ * just not yet confirmed delivered by the underlying channel (the Android gateway's
+ * inverted control flow — see `confirmAndSend` below). A `DRAFT` message, by contrast,
+ * hasn't been sent anywhere yet (review-before-send gate).
+ */
+export type SendMessageOutcome = "DRAFT" | "QUEUED" | "SENT" | "FAILED";
 
 export interface SendMessageResult {
   message: Message;
@@ -54,6 +61,7 @@ export interface SendMessageResult {
 function outcomeFromStatus(status: MessageStatus): SendMessageOutcome {
   if (status === "SENT" || status === "DELIVERED" || status === "READ") return "SENT";
   if (status === "FAILED" || status === "DEAD_LETTER") return "FAILED";
+  if (status === "QUEUED") return "QUEUED";
   return "DRAFT";
 }
 
@@ -163,23 +171,42 @@ export async function confirmAndSend(
     return handleSendFailure(organizationId, message, error);
   }
 
-  // The message is only ever marked SENT after the adapter call returns success with an
-  // external id — never optimistically.
-  assertValidTransition(message.status, "SENT");
-  const sent = await messageRepository.updateStatus(organizationId, messageId, "SENT", {
+  // The message is only ever marked SENT/QUEUED after the adapter call *returns success* —
+  // never optimistically. Per §3.2's `SendMessageResult.status: "SENT" | "QUEUED"`, most
+  // adapters (Telegram, WhatsApp) always return "SENT" here (their `sendMessage` really did
+  // call the upstream API synchronously) and this is functionally identical to Phase 5/6's
+  // original "always SENT" behavior for them. `AndroidSmsAdapter` (Phase 8) is the one
+  // adapter that returns "QUEUED": its inverted control flow means the row is only queued
+  // for device pickup at this point, not actually sent — the real `SENT` transition happens
+  // later, when the device calls `POST /api/gateways/messages/:id/acknowledge`
+  // (`acknowledgeMessage` below reuses `assertValidTransition`/`messageEventRepository` the
+  // exact same way this function does).
+  assertValidTransition(message.status, sendResult.status);
+  const updated = await messageRepository.updateStatus(organizationId, messageId, sendResult.status, {
     externalMessageId: sendResult.externalMessageId,
   });
   await messageEventRepository.create({
     messageId,
-    eventType: "sent",
+    eventType: sendResult.status === "SENT" ? "sent" : "queued_for_pickup",
     externalEventId: sendResult.externalMessageId,
     payload: { adapterStatus: sendResult.status },
   });
 
-  return { message: sent, outcome: "SENT" };
+  return { message: updated, outcome: outcomeFromStatus(updated.status) };
 }
 
-async function handleSendFailure(organizationId: string, message: Message, error: unknown): Promise<SendMessageResult> {
+/**
+ * Classifies + records a send failure and, for transient failures, schedules the next
+ * automatic retry (moving to `DEAD_LETTER` once the attempt cap is exceeded). Exported (not
+ * just used internally by `confirmAndSend`'s catch block) so the Android gateway's
+ * `POST /api/gateways/messages/:id/fail` route can report a *device-observed* send failure
+ * (the device's own carrier/SIM error, not a thrown adapter exception) through the exact
+ * same classification + retry-scheduling + `MessageEvent` logic, by constructing an
+ * `UpstreamAdapterError` with an explicit `detail.transient` hint (see
+ * `src/server/gateways/androidFailureReasons.ts`) and passing it here — no duplicated retry
+ * logic between the two entry points.
+ */
+export async function handleSendFailure(organizationId: string, message: Message, error: unknown): Promise<SendMessageResult> {
   const classification = classifyAdapterFailure(error);
   const failureReason = error instanceof Error ? error.message : "Unknown adapter failure";
 

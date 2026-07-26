@@ -181,9 +181,19 @@ docker-compose.yml        # Local Postgres 16
 
 **Telegram is fully implemented (Phase 6)** — see
 [`docs/channel-adapters.md`](./docs/channel-adapters.md) for bot creation via @BotFather,
-local-dev tunneling (ngrok/cloudflared), webhook registration, and production setup. The
-Android SMS gateway (Phase 8) and WhatsApp (Phase 9) sections of that doc are placeholders
-until those phases land.
+local-dev tunneling (ngrok/cloudflared), webhook registration, and production setup.
+
+**Android SMS gateway is fully implemented, server side (Phase 8)** — a physical Android
+device (its own SIM, no cloud SMS vendor) polls the server for outbound sends and pushes
+inbound SMS to it; see the "Android SMS gateway" section of
+[`docs/channel-adapters.md`](./docs/channel-adapters.md) for the complete `/api/gateways/*`
+API contract, and [`android-gateway/README.md`](./android-gateway/README.md) for the
+companion Android app's build specification (permissions, foreground service, battery
+optimization, retry behavior, carrier limitations, privacy disclosure). No Kotlin app ships
+in this repo yet — those two documents are the complete spec for building one.
+
+WhatsApp (Phase 9) is the one section of `docs/channel-adapters.md` still a placeholder
+until that phase lands.
 
 ## Multi-tenancy, security, and architecture notes
 

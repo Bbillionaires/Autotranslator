@@ -231,6 +231,21 @@ model ChannelAccount {
   // See security section (6.6) for the production encryption plan.
   credentialRef        String?
   status               ChannelAccountStatus @default(PENDING_SETUP)
+  // Phase 8 additive fields (docs/implementation-plan.md §6.3/§5 — Android SMS gateway
+  // device tracking). `ChannelAccount` doubles as the device record for ANDROID_SMS
+  // (per the Phase 8 brief: "don't invent a whole new model"), so these three columns are
+  // only ever populated for that channel type; every other channel type leaves them null,
+  // which is a safe/backward-compatible default for every pre-existing row.
+  //   - deviceTokenHash: sha256 of the device's signed token, never the raw token — see
+  //     src/server/gateways/androidAuth.ts. A DB leak alone never leaks a live credential.
+  //   - lastHeartbeatAt: bumped by POST /api/gateways/heartbeat; AndroidSmsAdapter's
+  //     healthCheck()/getDeviceHealth() read this for staleness.
+  //   - revokedAt: set by an admin revoking a device; androidAuth's authenticateDevice()
+  //     rejects any request once this is non-null, immediately, without rotating the
+  //     shared ANDROID_GATEWAY_SIGNING_SECRET (which would revoke every other device too).
+  deviceTokenHash      String?
+  lastHeartbeatAt      DateTime?
+  revokedAt            DateTime?
   createdAt            DateTime             @default(now())
   updatedAt            DateTime             @updatedAt
 
