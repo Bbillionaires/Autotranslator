@@ -23,12 +23,15 @@ const { channelAccountRepository } = await import("../repositories/channelAccoun
 const { contactRepository } = await import("../repositories/contactRepository");
 const { contactChannelIdentityRepository } = await import("../repositories/contactChannelIdentityRepository");
 const { conversationRepository } = await import("../repositories/conversationRepository");
+const { userRepository } = await import("../repositories/userRepository");
 const { channelAdapterRegistry } = await import("../channels");
 const { FakeChannelAdapter } = await import("../channels/__tests__/fakeAdapter");
-const { sendConversationMessage, confirmAndSendConversationMessage, retryConversationMessage } = await import("./messages");
+const { sendConversationMessage, confirmAndSendConversationMessage, retryConversationMessage, recordTranslationEdit } = await import(
+  "./messages"
+);
 
-function fakeSession(role: Session["user"]["role"], organizationId: string): Session {
-  return { user: { id: "u1", organizationId, role }, expires: "" } as Session;
+function fakeSession(role: Session["user"]["role"], organizationId: string, userId = "u1"): Session {
+  return { user: { id: userId, organizationId, role }, expires: "" } as Session;
 }
 
 let organizationId: string;
@@ -119,6 +122,38 @@ describe("confirmAndSendConversationMessage", () => {
     if (!confirmed.ok) return;
     expect(confirmed.data.outcome).toBe("SENT");
     expect(adapter.sentMessages).toHaveLength(1);
+  });
+});
+
+describe("recordTranslationEdit", () => {
+  it("rejects a session below Agent", async () => {
+    const { conversation } = await setUpConversation();
+    vi.mocked(auth).mockResolvedValue(fakeSession("AGENT", organizationId));
+    const draft = await sendConversationMessage({ conversationId: conversation.id, text: "Draft", reviewBeforeSend: true });
+    if (!draft.ok) throw new Error("setup failed");
+
+    vi.mocked(auth).mockResolvedValue(fakeSession("VIEWER", organizationId));
+    const result = await recordTranslationEdit({ messageId: draft.data.message.id, translatedText: "Edited" });
+    expect(result.ok).toBe(false);
+  });
+
+  it("persists an edited translation on a PENDING draft and marks translationEdited", async () => {
+    const { conversation } = await setUpConversation();
+    const actingAgent = await userRepository.create({
+      organizationId,
+      name: "Acting Agent",
+      email: `acting-agent-${Date.now()}-${Math.random()}@test.dev`,
+      role: "AGENT",
+    });
+    vi.mocked(auth).mockResolvedValue(fakeSession("AGENT", organizationId, actingAgent.id));
+    const draft = await sendConversationMessage({ conversationId: conversation.id, text: "Draft", reviewBeforeSend: true });
+    if (!draft.ok) throw new Error("setup failed");
+
+    const result = await recordTranslationEdit({ messageId: draft.data.message.id, translatedText: "Manually corrected" });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.data.translatedText).toBe("Manually corrected");
+    expect(result.data.translationEdited).toBe(true);
   });
 });
 

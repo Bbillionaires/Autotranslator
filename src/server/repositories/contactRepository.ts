@@ -47,6 +47,77 @@ export const contactRepository = {
     });
   },
 
+  /**
+   * Filtered/searchable listing for the Contacts screen (Phase 7), per
+   * docs/implementation-plan.md §5 ("Server Action `listContacts` | List/search/filter
+   * contacts | Session | Zod query schema: search, channel, language, archived"). Distinct
+   * from `listByOrg` (kept as-is since other callers use its simpler shape) to avoid
+   * changing that method's contract.
+   */
+  async listForContactsPage(
+    organizationId: string,
+    filters: {
+      search?: string;
+      channel?: import("@prisma/client").ChannelType;
+      language?: string;
+      archived?: "active" | "archived" | "all";
+    } = {},
+    client: PrismaClientOrTx = prisma,
+  ) {
+    const archived = filters.archived ?? "active";
+    return client.contact.findMany({
+      where: {
+        organizationId,
+        ...(archived === "active" ? { archivedAt: null } : archived === "archived" ? { archivedAt: { not: null } } : {}),
+        ...(filters.language
+          ? { OR: [{ preferredLanguage: filters.language }, { preferredLanguage: null, detectedLanguage: filters.language }] }
+          : {}),
+        ...(filters.channel ? { identities: { some: { channelAccount: { channelType: filters.channel } } } } : {}),
+        ...(filters.search
+          ? {
+              OR: [
+                { displayName: { contains: filters.search, mode: "insensitive" as const } },
+                { phoneNumber: { contains: filters.search, mode: "insensitive" as const } },
+                { email: { contains: filters.search, mode: "insensitive" as const } },
+              ],
+            }
+          : {}),
+      },
+      include: {
+        identities: { include: { channelAccount: true } },
+        _count: { select: { conversations: true } },
+      },
+      orderBy: { displayName: "asc" },
+    });
+  },
+
+  async findByIdWithDetails(organizationId: string, id: string, client: PrismaClientOrTx = prisma) {
+    const contact = await client.contact.findFirst({
+      where: { id, organizationId },
+      include: {
+        identities: { include: { channelAccount: true } },
+        conversations: { orderBy: { lastMessageAt: "desc" }, include: { channelAccount: true } },
+      },
+    });
+    if (!contact) {
+      throw new NotFoundError("Contact not found.", { organizationId, id });
+    }
+    return contact;
+  },
+
+  async update(
+    organizationId: string,
+    id: string,
+    input: Partial<{ displayName: string; phoneNumber: string | null; email: string | null; notes: string | null }>,
+    client: PrismaClientOrTx = prisma,
+  ) {
+    const result = await client.contact.updateMany({ where: { id, organizationId }, data: input });
+    if (result.count === 0) {
+      throw new NotFoundError("Contact not found.", { organizationId, id });
+    }
+    return contactRepository.findByIdInOrgOrThrow(organizationId, id, client);
+  },
+
   async findByPhoneNumber(organizationId: string, phoneNumber: string, client: PrismaClientOrTx = prisma) {
     return client.contact.findFirst({ where: { organizationId, phoneNumber } });
   },

@@ -8,6 +8,33 @@ on:
 jobs:
   lint-typecheck-schema:
     runs-on: ubuntu-latest
+    # Phase 5 onward added integration tests that run against a real Postgres test database
+    # (see src/server/messaging/__tests__/testDb.ts) — `autotranslator_test` on the same
+    # default dev credentials as docker-compose.yml. This service container + the migrate/
+    # createdb steps below give CI the same test database those tests assume; without it,
+    # every `*.test.ts` file that calls `configureTestDatabaseEnv()` would fail in CI even
+    # though it passes locally against the docker-compose Postgres.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: autotranslator
+          POSTGRES_PASSWORD: autotranslator_dev_password
+          POSTGRES_DB: autotranslator
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U autotranslator -d autotranslator"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: "postgresql://autotranslator:autotranslator_dev_password@localhost:5432/autotranslator?schema=public"
+      DIRECT_URL: "postgresql://autotranslator:autotranslator_dev_password@localhost:5432/autotranslator?schema=public"
+      TEST_DATABASE_URL: "postgresql://autotranslator:autotranslator_dev_password@localhost:5432/autotranslator_test?schema=public"
+      AUTH_SECRET: "ci-only-auth-secret-do-not-use-in-production"
+      APP_URL: "http://localhost:3000"
+      TRANSLATION_PROVIDER: "noop"
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +54,15 @@ jobs:
 
       - name: Validate Prisma schema
         run: npx prisma validate
+
+      - name: Create test database
+        run: PGPASSWORD=autotranslator_dev_password psql -h localhost -U autotranslator -d autotranslator -c "CREATE DATABASE autotranslator_test;"
+
+      - name: Apply migrations to test database
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+          DIRECT_URL: ${{ env.TEST_DATABASE_URL }}
 
       - name: Unit tests
         run: npm test

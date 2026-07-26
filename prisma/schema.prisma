@@ -80,8 +80,15 @@ model Organization {
   name            String
   defaultLanguage String   @default("en")
   timezone        String   @default("UTC")
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  // Phase 7 additive fields (see docs/implementation-plan.md Phase 7 deliverables: Settings
+  // "review-before-send default" and "data retention setting"). Both are small, additive,
+  // backward-compatible columns — no existing row needs a data migration since both have
+  // safe defaults (review-before-send off; retention null = "keep forever", i.e. no
+  // enforced deletion window, matching current pre-Phase-7 behavior exactly).
+  reviewBeforeSendDefault Boolean  @default(false)
+  dataRetentionDays       Int?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
 
   users                 User[]
   teams                 Team[]
@@ -264,6 +271,12 @@ model Conversation {
   assignedTeamId            String?
   preferredLanguageOverride String?
   status                    ConversationStatus @default(OPEN)
+  // Phase 7 additive field, per docs/implementation-plan.md §6.9 ("an explicit opt-in
+  // 'high-risk conversation' flag settable per-conversation"). The plan's §4 schema draft
+  // predates this requirement and has no column for it; adding a single `Boolean @default
+  // (false)` field is the smallest additive change that gives §6.9 a home without touching
+  // any other model or existing row (default false preserves current behavior exactly).
+  highRisk                  Boolean            @default(false)
   lastMessageAt             DateTime?
   createdAt                 DateTime           @default(now())
   updatedAt                 DateTime           @updatedAt

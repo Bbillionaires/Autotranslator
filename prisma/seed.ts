@@ -50,6 +50,9 @@ async function main() {
       name: "Acme Demo Co",
       defaultLanguage: "en",
       timezone: "UTC",
+      // Phase 7 additive org settings — demo values so Settings has something real to show.
+      reviewBeforeSendDefault: false,
+      dataRetentionDays: 365,
     },
   });
 
@@ -435,6 +438,8 @@ async function main() {
       channelAccountId: androidAccount.id,
       assignedUserId: agent.id,
       status: ConversationStatus.OPEN,
+      // Marked high-risk so the Phase 7 warning banner (§6.9) has a seeded example to show.
+      highRisk: true,
     },
   });
   const hiroshiT0 = new Date("2026-07-24T08:00:00Z");
@@ -595,6 +600,17 @@ async function main() {
     ],
   });
   await touchConversation(johnConversation.id, johnT1);
+
+  // ---------- Glossary (demo entry so the Phase 7 glossary management UI has data) ----------
+  await prisma.translationGlossary.create({
+    data: {
+      organizationId: org.id,
+      name: "Product names (ES → EN)",
+      sourceLanguage: "es",
+      targetLanguage: "en",
+      terms: [{ term: "pedido", translation: "order", notes: "Keep 'order' consistent across support replies." }],
+    },
+  });
 
   console.log("Seed complete.\n");
   console.log("Seeded organization:", org.name);

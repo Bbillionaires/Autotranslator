@@ -12,7 +12,13 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    // Phase 7 adds React Testing Library component tests (*.test.tsx) alongside the
+    // existing server-side *.test.ts files. Those opt into jsdom per-file via a
+    // `// @vitest-environment jsdom` docblock (see e.g.
+    // src/app/(app)/inbox/[conversationId]/message-thread.test.tsx) rather than switching
+    // the whole suite to jsdom, since the vast majority of tests here are server-side
+    // Prisma/Vitest integration tests that are faster and more correct under "node".
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
     setupFiles: ["./vitest.setup.ts"],
     // Several integration test files share ONE physical test Postgres database and create
     // their own Organization/ChannelAccount rows, cleaning them up in `afterEach`. Almost

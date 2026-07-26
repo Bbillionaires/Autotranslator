@@ -21,10 +21,12 @@
  * `retryMessage`" row, wrapping `outboundService.retryMessage` the same way.
  */
 import { z } from "zod";
+import type { Message } from "@prisma/client";
 import { auth } from "../auth";
 import { channelAdapterRegistry } from "../channels";
-import { toSafeActionError } from "../errors";
+import { toSafeActionError, ValidationError } from "../errors";
 import { confirmAndSend, sendMessage, retryMessage as retryOutboundMessage, type SendMessageResult } from "../messaging/outboundService";
+import { auditLogRepository } from "../repositories/auditLogRepository";
 import { channelAccountRepository } from "../repositories/channelAccountRepository";
 import { conversationRepository } from "../repositories/conversationRepository";
 import { messageRepository } from "../repositories/messageRepository";
@@ -105,6 +107,47 @@ export async function retryConversationMessage(input: { messageId: string }): Pr
     const { adapter } = await resolveAdapterForMessage(organizationId, input.messageId);
     const result = await retryOutboundMessage(organizationId, input.messageId, { adapter });
     return { ok: true, data: result };
+  } catch (error) {
+    return { ok: false, ...toSafeActionError(error) };
+  }
+}
+
+const recordTranslationEditSchema = z.object({
+  messageId: z.string().min(1),
+  translatedText: z.string().min(1, "Translated text is required."),
+});
+
+/**
+ * Server Action `recordTranslationEdit`, per §5 ("Persist a user edit to `translatedText`
+ * pre-send | Session+Role(Agent+) | sets `translationEdited: true`; audit-logged"). Used by
+ * the review-before-send draft view (Phase 7) when a user edits the machine translation
+ * before confirming send — an explicit, audit-logged edit, never a silent overwrite.
+ */
+export async function recordTranslationEdit(
+  input: z.infer<typeof recordTranslationEditSchema>,
+): Promise<ActionResult<Message>> {
+  try {
+    const session = await auth();
+    requireRole(session?.user?.role, "AGENT");
+    const organizationId = session!.user.organizationId;
+
+    const parsed = recordTranslationEditSchema.parse(input);
+    const existing = await messageRepository.findByIdInOrgOrThrow(organizationId, parsed.messageId);
+    if (existing.status !== "PENDING") {
+      throw new ValidationError("Only a pending (not-yet-sent) draft's translation can be edited.");
+    }
+
+    const updated = await messageRepository.markTranslationEdited(organizationId, parsed.messageId, parsed.translatedText);
+
+    await auditLogRepository.record({
+      organizationId,
+      userId: session!.user.id,
+      action: "message.translation_edited",
+      entityType: "Message",
+      entityId: parsed.messageId,
+    });
+
+    return { ok: true, data: updated };
   } catch (error) {
     return { ok: false, ...toSafeActionError(error) };
   }

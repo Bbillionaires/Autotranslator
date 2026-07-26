@@ -33,7 +33,13 @@ export const organizationRepository = {
 
   async updateSettings(
     organizationId: string,
-    input: Partial<{ name: string; defaultLanguage: string; timezone: string }>,
+    input: Partial<{
+      name: string;
+      defaultLanguage: string;
+      timezone: string;
+      reviewBeforeSendDefault: boolean;
+      dataRetentionDays: number | null;
+    }>,
   ) {
     // Scoped by id — the caller is responsible for verifying the session's organizationId
     // matches before calling this (there is only ever one organization to update: the
