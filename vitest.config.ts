@@ -14,6 +14,18 @@ export default defineConfig({
     environment: "node",
     include: ["src/**/*.test.ts"],
     setupFiles: ["./vitest.setup.ts"],
+    // Several integration test files share ONE physical test Postgres database and create
+    // their own Organization/ChannelAccount rows, cleaning them up in `afterEach`. Almost
+    // all of them scope every query by their own `organizationId`, so running test FILES in
+    // parallel (Vitest's default) is safe. The one exception (added in Phase 6,
+    // src/app/api/channels/telegram/webhook/route.test.ts) exercises a deliberately
+    // cross-org lookup (`channelAccountRepository.findFirstActiveByChannelType` — the
+    // Telegram webhook route's MVP "single global bot token" resolution strategy, see that
+    // repository method's doc comment) which cannot be org-scoped by construction. Running
+    // it concurrently with other files that also create ACTIVE Telegram ChannelAccount rows
+    // races non-deterministically. Disabling file parallelism trades a slower `npm test` for
+    // a suite that isn't flaky — acceptable at this project's current test-suite size.
+    fileParallelism: false,
     coverage: {
       provider: "v8",
       reporter: ["text", "html"],

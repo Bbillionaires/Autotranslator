@@ -1,0 +1,111 @@
+"use server";
+
+/**
+ * Server Action `sendMessage` (named `sendConversationMessage` here to avoid clashing with
+ * `../messaging/outboundService`'s `sendMessage`), per docs/implementation-plan.md §5
+ * ("Messages | Server Action `sendMessage` | Compose + translate + send outbound |
+ * Session+Role(Agent+) | Zod: text non-empty, idempotencyKey uuid; runs full outbound
+ * lifecycle (§3.6)").
+ *
+ * This is the missing "compose path" glue the Phase 6 task brief asked to verify/add:
+ * `outboundService.sendMessage` (Phase 5) already implements the full §3.6 lifecycle but
+ * takes a resolved `MessagingChannelAdapter` as an explicit dependency rather than looking
+ * one up itself (by design — keeps the service layer adapter-agnostic and unit-testable
+ * with `FakeChannelAdapter`). This action is the thin, auth-guarded, org-scoped wrapper that
+ * resolves the conversation's channel and its registered adapter (Telegram today; whatever
+ * Phase 8/9 register later) via `channelAdapterRegistry`, then delegates — so a Telegram
+ * conversation's outbound reply is translated into the contact's language and actually
+ * delivered end-to-end via `TelegramAdapter.sendMessage`.
+ *
+ * `retryConversationMessage` is the Server Action counterpart of §5's "Server Action
+ * `retryMessage`" row, wrapping `outboundService.retryMessage` the same way.
+ */
+import { z } from "zod";
+import { auth } from "../auth";
+import { channelAdapterRegistry } from "../channels";
+import { toSafeActionError } from "../errors";
+import { confirmAndSend, sendMessage, retryMessage as retryOutboundMessage, type SendMessageResult } from "../messaging/outboundService";
+import { channelAccountRepository } from "../repositories/channelAccountRepository";
+import { conversationRepository } from "../repositories/conversationRepository";
+import { messageRepository } from "../repositories/messageRepository";
+import { requireRole } from "../roles";
+
+const sendConversationMessageSchema = z.object({
+  conversationId: z.string().min(1),
+  text: z.string().min(1, "Message text is required."),
+  clientIdempotencyKey: z.string().uuid().optional(),
+  reviewBeforeSend: z.boolean().optional(),
+});
+
+export type SendConversationMessageInput = z.infer<typeof sendConversationMessageSchema>;
+
+type ActionResult<T> = { ok: true; data: T } | { ok: false; message: string; code: string; requestId: string };
+
+/** Resolves the registered adapter for a conversation's channel, org-scoped throughout. */
+async function resolveAdapterForConversation(organizationId: string, conversationId: string) {
+  const conversation = await conversationRepository.findByIdInOrgOrThrow(organizationId, conversationId);
+  const channelAccount = await channelAccountRepository.findByIdInOrgOrThrow(organizationId, conversation.channelAccountId);
+  const adapter = channelAdapterRegistry.getOrThrow(channelAccount.channelType);
+  return { conversation, channelAccount, adapter };
+}
+
+/** Resolves the registered adapter for whichever conversation a given message belongs to. */
+async function resolveAdapterForMessage(organizationId: string, messageId: string) {
+  const message = await messageRepository.findByIdInOrgOrThrow(organizationId, messageId);
+  return resolveAdapterForConversation(organizationId, message.conversationId);
+}
+
+export async function sendConversationMessage(input: SendConversationMessageInput): Promise<ActionResult<SendMessageResult>> {
+  try {
+    const session = await auth();
+    requireRole(session?.user?.role, "AGENT");
+    const organizationId = session!.user.organizationId;
+
+    const parsed = sendConversationMessageSchema.parse(input);
+    const { adapter } = await resolveAdapterForConversation(organizationId, parsed.conversationId);
+
+    const result = await sendMessage(
+      {
+        organizationId,
+        conversationId: parsed.conversationId,
+        text: parsed.text,
+        clientIdempotencyKey: parsed.clientIdempotencyKey,
+        reviewBeforeSend: parsed.reviewBeforeSend,
+      },
+      { adapter },
+    );
+    return { ok: true, data: result };
+  } catch (error) {
+    return { ok: false, ...toSafeActionError(error) };
+  }
+}
+
+/** Confirms a previously-drafted (review-before-send) message — Server Action wrapper around `confirmAndSend`. */
+export async function confirmAndSendConversationMessage(input: { messageId: string }): Promise<ActionResult<SendMessageResult>> {
+  try {
+    const session = await auth();
+    requireRole(session?.user?.role, "AGENT");
+    const organizationId = session!.user.organizationId;
+
+    const { adapter } = await resolveAdapterForMessage(organizationId, input.messageId);
+    const result = await confirmAndSend(organizationId, input.messageId, { adapter });
+    return { ok: true, data: result };
+  } catch (error) {
+    return { ok: false, ...toSafeActionError(error) };
+  }
+}
+
+/** Server Action `retryMessage`, per §5 ("only allowed on terminal-failed states"). */
+export async function retryConversationMessage(input: { messageId: string }): Promise<ActionResult<SendMessageResult>> {
+  try {
+    const session = await auth();
+    requireRole(session?.user?.role, "AGENT");
+    const organizationId = session!.user.organizationId;
+
+    const { adapter } = await resolveAdapterForMessage(organizationId, input.messageId);
+    const result = await retryOutboundMessage(organizationId, input.messageId, { adapter });
+    return { ok: true, data: result };
+  } catch (error) {
+    return { ok: false, ...toSafeActionError(error) };
+  }
+}

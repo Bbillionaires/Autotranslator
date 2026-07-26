@@ -179,11 +179,11 @@ docker-compose.yml        # Local Postgres 16
 
 ## Channel adapters
 
-Telegram, the Android SMS gateway, and WhatsApp integration setup are **not part of Phase
-3** — this section is a placeholder for the phases that implement them. Once built, full
-setup instructions (bot registration, webhook configuration, device pairing, Meta App
-setup) will live in **`docs/channel-adapters.md`** (added in a later phase) and be linked
-from here.
+**Telegram is fully implemented (Phase 6)** — see
+[`docs/channel-adapters.md`](./docs/channel-adapters.md) for bot creation via @BotFather,
+local-dev tunneling (ngrok/cloudflared), webhook registration, and production setup. The
+Android SMS gateway (Phase 8) and WhatsApp (Phase 9) sections of that doc are placeholders
+until those phases land.
 
 ## Multi-tenancy, security, and architecture notes
 

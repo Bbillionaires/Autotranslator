@@ -23,7 +23,6 @@ import type { ChannelAccount, Contact, Conversation, Message } from "@prisma/cli
 import { isUniqueConstraintViolation, prisma } from "../db";
 import { withContext } from "../logger";
 import { organizationRepository } from "../repositories/organizationRepository";
-import { contactChannelIdentityRepository } from "../repositories/contactChannelIdentityRepository";
 import { contactRepository } from "../repositories/contactRepository";
 import { conversationRepository } from "../repositories/conversationRepository";
 import { messageEventRepository } from "../repositories/messageEventRepository";
@@ -32,6 +31,7 @@ import { userRepository } from "../repositories/userRepository";
 import { TranslationEngine, translationEngine } from "../translation/engine";
 import { resolveTargetLanguage } from "../translation/resolveLanguage";
 import type { NormalizedInboundMessage } from "../channels/types";
+import { resolveOrCreateContactAndConversation } from "./contactResolution";
 import { deriveInboundIdempotencyKey } from "./idempotency";
 
 export interface ProcessInboundMessageDeps {
@@ -61,47 +61,10 @@ export async function processInboundMessage(
   const idempotencyKey = deriveInboundIdempotencyKey(channelAccount.id, normalized.externalMessageId);
 
   // Step 5: resolve/create Contact + ContactChannelIdentity + canonical Conversation.
-  const { contact, conversation } = await prisma.$transaction(async (tx) => {
-    const identity = await contactChannelIdentityRepository.findByChannelAndExternalId(
-      organizationId,
-      channelAccount.id,
-      normalized.externalContactId,
-      tx,
-    );
-
-    let resolvedContact: Contact;
-    if (identity) {
-      resolvedContact = await contactRepository.findByIdInOrgOrThrow(organizationId, identity.contactId, tx);
-    } else {
-      resolvedContact = await contactRepository.create(
-        organizationId,
-        {
-          displayName: normalized.externalUsername ?? normalized.phoneNumber ?? normalized.externalContactId,
-          phoneNumber: normalized.phoneNumber ?? null,
-        },
-        tx,
-      );
-      await contactChannelIdentityRepository.create(
-        organizationId,
-        {
-          contactId: resolvedContact.id,
-          channelAccountId: channelAccount.id,
-          externalContactId: normalized.externalContactId,
-          externalUsername: normalized.externalUsername ?? null,
-          phoneNumber: normalized.phoneNumber ?? null,
-        },
-        tx,
-      );
-    }
-
-    const resolvedConversation = await conversationRepository.upsertForContactAndChannel(
-      organizationId,
-      resolvedContact.id,
-      channelAccount.id,
-      tx,
-    );
-
-    return { contact: resolvedContact, conversation: resolvedConversation };
+  const { contact, conversation } = await resolveOrCreateContactAndConversation(organizationId, channelAccount, {
+    externalContactId: normalized.externalContactId,
+    externalUsername: normalized.externalUsername,
+    phoneNumber: normalized.phoneNumber,
   });
 
   let effectiveContact = contact;

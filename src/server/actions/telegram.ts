@@ -1,0 +1,139 @@
+"use server";
+
+/**
+ * Telegram Server Actions, per docs/implementation-plan.md §5:
+ *
+ *   Server Action `getTelegramWebhookConfig` — returns the webhook URL + secret-setup
+ *   instructions for admin to register with BotFather/`setWebhook` | Session+Role(Administrator+)
+ *   | read-only helper, no external call unless "register" is explicitly clicked.
+ *
+ * `registerTelegramWebhook` is the "if you have time" nice-to-have the Phase 6 task brief
+ * called out: it actually calls Telegram's `setWebhook` API (instead of leaving that as a
+ * manual copy-paste step) and, on success, ensures a `ChannelAccount` exists for this org so
+ * the webhook route's resolution logic (see the webhook route's doc comment) has something
+ * to find. `getTelegramHealthStatus` backs the minimal Settings UI section (deliverable #12)
+ * without the client component needing to fetch `/api/channels/telegram/health` directly.
+ */
+import { auth } from "../auth";
+import { channelAdapterRegistry } from "../channels";
+import type { TelegramAdapter } from "../channels/telegram/adapter";
+import { env } from "../env";
+import { NotConfiguredError, UpstreamAdapterError, toSafeActionError } from "../errors";
+import { channelAccountRepository } from "../repositories/channelAccountRepository";
+import { requireRole } from "../roles";
+
+export interface TelegramWebhookConfig {
+  webhookUrl: string;
+  secretConfigured: boolean;
+  botTokenConfigured: boolean;
+  telegramEnabled: boolean;
+  instructions: string[];
+}
+
+type ActionResult<T> = { ok: true; data: T } | { ok: false; message: string; code: string; requestId: string };
+
+function webhookUrl(): string {
+  return new URL("/api/channels/telegram/webhook", env.APP_URL).toString();
+}
+
+export async function getTelegramWebhookConfig(): Promise<ActionResult<TelegramWebhookConfig>> {
+  try {
+    const session = await auth();
+    requireRole(session?.user?.role, "ADMINISTRATOR");
+
+    const url = webhookUrl();
+    return {
+      ok: true,
+      data: {
+        webhookUrl: url,
+        secretConfigured: Boolean(env.TELEGRAM_WEBHOOK_SECRET),
+        botTokenConfigured: Boolean(env.TELEGRAM_BOT_TOKEN),
+        telegramEnabled: env.TELEGRAM_ENABLED,
+        instructions: [
+          "Create a bot via @BotFather on Telegram and copy the bot token into TELEGRAM_BOT_TOKEN.",
+          "Choose a random secret string and set it as TELEGRAM_WEBHOOK_SECRET.",
+          `Register the webhook: call https://api.telegram.org/bot<token>/setWebhook with body {"url": "${url}", "secret_token": "<TELEGRAM_WEBHOOK_SECRET>"} — or use "Register webhook now" below.`,
+          "Set TELEGRAM_ENABLED=true and restart the app so the adapter is registered.",
+        ],
+      },
+    };
+  } catch (error) {
+    return { ok: false, ...toSafeActionError(error) };
+  }
+}
+
+export interface TelegramHealthStatus {
+  enabled: boolean;
+  healthy: boolean;
+  detail?: string;
+}
+
+export async function getTelegramHealthStatus(): Promise<ActionResult<TelegramHealthStatus>> {
+  try {
+    const session = await auth();
+    requireRole(session?.user?.role, "ADMINISTRATOR");
+
+    const adapter = channelAdapterRegistry.get("TELEGRAM");
+    if (!adapter) {
+      return { ok: true, data: { enabled: false, healthy: false, detail: "TELEGRAM_ENABLED is false." } };
+    }
+    const health = await adapter.healthCheck();
+    return { ok: true, data: { enabled: true, ...health } };
+  } catch (error) {
+    return { ok: false, ...toSafeActionError(error) };
+  }
+}
+
+export interface RegisterTelegramWebhookResult {
+  description: string;
+}
+
+/**
+ * Calls Telegram's `setWebhook` directly with the configured secret token, then ensures an
+ * ACTIVE `ChannelAccount` of type TELEGRAM exists for the caller's org (creating one, keyed
+ * by the bot's own id/username via `getMe`, if none exists yet). This is the "connect a
+ * Telegram bot" action the minimal Settings UI section exposes.
+ */
+export async function registerTelegramWebhook(): Promise<ActionResult<RegisterTelegramWebhookResult>> {
+  try {
+    const session = await auth();
+    requireRole(session?.user?.role, "ADMINISTRATOR");
+
+    if (!env.TELEGRAM_ENABLED) {
+      throw new NotConfiguredError("Telegram is not enabled. Set TELEGRAM_ENABLED=true and restart the app first.");
+    }
+    if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_WEBHOOK_SECRET) {
+      throw new NotConfiguredError("TELEGRAM_BOT_TOKEN and TELEGRAM_WEBHOOK_SECRET must both be set.");
+    }
+
+    const url = webhookUrl();
+    const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, secret_token: env.TELEGRAM_WEBHOOK_SECRET }),
+    });
+    const body = (await response.json()) as { ok: boolean; description?: string; error_code?: number };
+    if (!response.ok || !body.ok) {
+      throw new UpstreamAdapterError(body.description ?? "Telegram setWebhook call failed.", {
+        status: body.error_code ?? response.status,
+      });
+    }
+
+    const organizationId = session!.user.organizationId;
+    const existing = await channelAccountRepository.listByChannelType(organizationId, "TELEGRAM");
+    if (existing.length === 0) {
+      const adapter = channelAdapterRegistry.get("TELEGRAM") as TelegramAdapter | undefined;
+      const botInfo = adapter ? await adapter.getBotInfo() : null;
+      await channelAccountRepository.create(organizationId, {
+        channelType: "TELEGRAM",
+        displayName: botInfo?.username ? `@${botInfo.username}` : "Telegram Bot",
+        externalAccountId: botInfo ? String(botInfo.id) : undefined,
+        status: "ACTIVE",
+      });
+    }
+
+    return { ok: true, data: { description: body.description ?? "Webhook registered." } };
+  } catch (error) {
+    return { ok: false, ...toSafeActionError(error) };
+  }
+}
