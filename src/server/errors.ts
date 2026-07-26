@@ -18,6 +18,8 @@ export type AppErrorCode =
   | "VALIDATION_ERROR"
   | "CONFLICT"
   | "UPSTREAM_ADAPTER_ERROR"
+  | "NOT_CONFIGURED"
+  | "NOT_IMPLEMENTED"
   | "INTERNAL_ERROR";
 
 /** Base class for every "expected" application error. Never leaks a stack trace to clients. */
@@ -65,6 +67,29 @@ export class ConflictError extends AppError {
 export class UpstreamAdapterError extends AppError {
   constructor(message = "An upstream service failed to respond correctly.", detail?: unknown) {
     super(message, "UPSTREAM_ADAPTER_ERROR", 502, detail);
+  }
+}
+
+/**
+ * Thrown when a feature exists in code but is missing required runtime configuration
+ * (e.g. `OpenAiTranslationProvider` invoked with no `OPENAI_API_KEY` set). Distinct from
+ * `NotImplementedError`: the code path is real, it just can't run without credentials.
+ */
+export class NotConfiguredError extends AppError {
+  constructor(message = "This feature is not configured.", detail?: unknown) {
+    super(message, "NOT_CONFIGURED", 503, detail);
+  }
+}
+
+/**
+ * Thrown by stubbed/placeholder implementations reserved for a future phase (e.g.
+ * `GoogleTranslateProvider`, `DeepLProvider`, the Messenger/Instagram/Email channel
+ * adapters) — proves the relevant interface supports swapping without those
+ * implementations actually existing yet.
+ */
+export class NotImplementedError extends AppError {
+  constructor(message = "This feature is not implemented yet.", detail?: unknown) {
+    super(message, "NOT_IMPLEMENTED", 501, detail);
   }
 }
 
