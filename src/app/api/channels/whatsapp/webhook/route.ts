@@ -52,6 +52,7 @@ import { handleRouteError, ValidationError } from "@/server/errors";
 import { withContext } from "@/server/logger";
 import { applyDeliveryStatusUpdate } from "@/server/messaging/deliveryStatusService";
 import { processInboundMessage } from "@/server/messaging/inboundService";
+import { getClientIp, rateLimitedResponse, webhookRateLimiter } from "@/server/rateLimit";
 import { channelAccountRepository } from "@/server/repositories/channelAccountRepository";
 
 /** Local constant-time compare — same pattern as `WhatsAppAdapter`/`TelegramAdapter`/`androidAuth.ts` (one small self-contained copy per file, not a premature shared abstraction). */
@@ -68,6 +69,12 @@ function constantTimeEquals(a: string, b: string): boolean {
 export async function GET(req: Request): Promise<Response> {
   if (!channelAdapterRegistry.get("WHATSAPP")) {
     return new Response("Not found", { status: 404 });
+  }
+
+  // H2 fix (docs/review-report.md): rate-limited per-IP, same as the POST handler below.
+  const rateLimit = webhookRateLimiter.check(getClientIp(req));
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse();
   }
 
   const url = new URL(req.url);
@@ -87,6 +94,13 @@ export async function POST(req: Request): Promise<Response> {
   const adapter = channelAdapterRegistry.get("WHATSAPP") as WhatsAppAdapter | undefined;
   if (!adapter) {
     return Response.json({ error: "WhatsApp channel is not enabled." }, { status: 404 });
+  }
+
+  // H2 fix (docs/review-report.md): rate-limited per-IP, before any signature validation or
+  // DB/OpenAI work — a flood (valid or invalid signature) shouldn't get further than this.
+  const rateLimit = webhookRateLimiter.check(getClientIp(req));
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse();
   }
 
   const isValid = await adapter.validateWebhook(req);

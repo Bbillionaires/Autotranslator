@@ -7,6 +7,7 @@
 import type { Role } from "@prisma/client";
 import { prisma } from "../db";
 import { NotFoundError } from "../errors";
+import { logger } from "../logger";
 
 export const userRepository = {
   /** Find a user by id, scoped to an organization. Returns null if not found or wrong org. */
@@ -26,11 +27,25 @@ export const userRepository = {
    * Find a user by email. NOT org-scoped by design — this is the one lookup that must
    * cross organizations, because sign-in happens before we know which org a session
    * belongs to (email is only unique per-organization, see the `@@unique([organizationId,
-   * email])` constraint, so in the rare case of the same email existing in multiple
-   * orgs this returns the first match — acceptable for MVP since orgs are invite-only).
+   * email])` constraint).
+   *
+   * M3 fix (docs/review-report.md): this used to be a bare `findFirst`, silently returning
+   * an arbitrary match — order-dependent and non-deterministic — if the same email ever
+   * existed in more than one organization. Used by the Auth.js Prisma adapter's
+   * `getUserByEmail` override (the magic-link sign-in flow), so a silent wrong-org pick here
+   * would authenticate someone into the wrong organization's account. Now: zero matches
+   * returns `null` (unchanged); exactly one match returns it (unchanged, the common case);
+   * MORE than one match throws instead of guessing — a documented tradeoff (this product
+   * has no org-selector UI, so treats email as required-globally-unique in practice; the
+   * real fix is either an org-selector UI or a DB-level global-unique-email constraint).
    */
   async findByEmail(email: string) {
-    return prisma.user.findFirst({ where: { email } });
+    const matches = await prisma.user.findMany({ where: { email } });
+    if (matches.length > 1) {
+      logger.warn({ email, matchCount: matches.length }, "userRepository.findByEmail: multiple accounts share this email across organizations");
+      throw new Error("Multiple accounts found for this email; contact support.");
+    }
+    return matches[0] ?? null;
   },
 
   async listByOrg(organizationId: string) {

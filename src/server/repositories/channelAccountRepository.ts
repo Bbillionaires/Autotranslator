@@ -37,26 +37,31 @@ export const channelAccountRepository = {
   },
 
   /**
-   * Cross-org lookup — the one legitimate exception to "every repository function takes the
-   * caller's organizationId" (same rationale as `userRepository.findByEmail`). Used ONLY by
-   * the Telegram webhook route (`src/app/api/channels/telegram/webhook/route.ts`) to resolve
-   * which organization's `ChannelAccount` an inbound webhook belongs to, before any
-   * `organizationId` is known. This MVP supports exactly one global Telegram bot token
-   * (`env.TELEGRAM_BOT_TOKEN`), so at most one active `ChannelAccount` of a given channel
-   * type is expected to exist across the whole deployment — multi-bot/multi-org support for
-   * a single channel type is a documented post-MVP gap (see docs/channel-adapters.md).
+   * Cross-org existence check — used ONLY by `registerTelegramWebhook`
+   * (`src/server/actions/telegram.ts`) to hard-block a second organization from ever
+   * activating a Telegram `ChannelAccount` while this deployment shares one global
+   * `TELEGRAM_BOT_TOKEN` (see C1 in docs/review-report.md, fixed here: previously nothing
+   * prevented a second org from creating its own ACTIVE Telegram `ChannelAccount`, which
+   * caused every inbound webhook to silently resolve to whichever org's account was
+   * created first — real cross-tenant data leakage). Returns the first ACTIVE
+   * `ChannelAccount` of `channelType` belonging to any organization OTHER than
+   * `organizationId`, or `null` if none exists (the common, single-org case).
    */
-  async findFirstActiveByChannelType(channelType: ChannelType, client: PrismaClientOrTx = prisma) {
+  async findFirstActiveByChannelTypeInOtherOrg(
+    channelType: ChannelType,
+    organizationId: string,
+    client: PrismaClientOrTx = prisma,
+  ) {
     return client.channelAccount.findFirst({
-      where: { channelType, status: "ACTIVE" },
+      where: { channelType, status: "ACTIVE", organizationId: { not: organizationId } },
       orderBy: { createdAt: "asc" },
     });
   },
 
   /**
-   * Cross-org lookup by bare id — a second legitimate exception to "every repository
-   * function takes the caller's organizationId" (see `findFirstActiveByChannelType` above
-   * for the precedent/rationale). Used ONLY by `src/server/gateways/androidAuth.ts` to
+   * Cross-org lookup by bare id — a legitimate exception to "every repository function
+   * takes the caller's organizationId" (see `findFirstActiveByChannelTypeInOtherOrg` above
+   * for a related precedent). Used ONLY by `src/server/gateways/androidAuth.ts` to
    * resolve a device's `ChannelAccount` from the deviceId embedded in its signed token,
    * *before* any `organizationId` is known — unlike every other Android gateway operation,
    * which is immediately re-scoped to `channelAccount.organizationId` once this lookup
@@ -71,7 +76,7 @@ export const channelAccountRepository = {
 
   /**
    * Cross-org lookup by channel type + `externalAccountId` — the WhatsApp analogue of
-   * `findFirstActiveByChannelType` above. Used ONLY by the WhatsApp webhook route
+   * `listAllActiveByChannelType` below. Used ONLY by the WhatsApp webhook route
    * (`src/app/api/channels/whatsapp/webhook/route.ts`) to resolve which organization's
    * `ChannelAccount` an inbound webhook `value` block belongs to, via
    * `value.metadata.phone_number_id` (§3.5 step 2: "for WhatsApp, the phone_number_id in the

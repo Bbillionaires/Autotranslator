@@ -103,16 +103,35 @@ ordinary chat messages — see `src/app/api/channels/telegram/webhook/route.ts`)
 
 ### Known limitations (documented, not hidden)
 
-- **One global bot token per deployment.** `TELEGRAM_BOT_TOKEN`/`TELEGRAM_WEBHOOK_SECRET`
-  are single, deployment-wide env vars (not per-organization credentials), so the webhook
-  route resolves which organization a delivery belongs to via "the first `ACTIVE`
-  `ChannelAccount` of type TELEGRAM" (`channelAccountRepository.findFirstActiveByChannelType`)
-  rather than a true per-org bot-token lookup. This matches the MVP's `ChannelAccount.credentialRef`
-  design (§6.6 of the implementation plan: real per-org secret storage/encryption is a
-  documented production plan, not built in this MVP). Multiple organizations each running
-  their own Telegram bot is a **post-MVP gap** — the fix is per-org credential storage plus
-  either per-org webhook paths (e.g. `/api/channels/telegram/webhook/[channelAccountId]`) or
-  looking up the bot id via `getMe` per request and matching `ChannelAccount.externalAccountId`.
+- **One global bot token per deployment — actively enforced, not just documented.**
+  `TELEGRAM_BOT_TOKEN`/`TELEGRAM_WEBHOOK_SECRET` are single, deployment-wide env vars (not
+  per-organization credentials), so the webhook route resolves which organization a
+  delivery belongs to via "the sole `ACTIVE` `ChannelAccount` of type TELEGRAM across the
+  whole deployment" (`channelAccountRepository.listAllActiveByChannelType` in
+  `resolveTelegramChannelAccount`), not a true per-org bot-token lookup. An earlier version
+  of this MVP left that as an unenforced assumption — a second organization could silently
+  create its own ACTIVE Telegram `ChannelAccount`, and every inbound webhook would then
+  resolve to whichever org's account was created first, leaking that org's Telegram
+  contacts/conversations/messages into the other org's inbox. **This is now hard-blocked**:
+  `registerTelegramWebhook` (`src/server/actions/telegram.ts`) checks — across ALL
+  organizations, not just the caller's own — whether a different organization already has
+  an ACTIVE Telegram `ChannelAccount` before ever creating a new one, and throws a
+  `ConflictError` ("This deployment's Telegram bot is already connected to another
+  organization. Multi-org Telegram requires per-org bot tokens, not yet supported.") if so
+  — no side effects, no `setWebhook` call is even made. As defense-in-depth,
+  `resolveTelegramChannelAccount` itself also checks this invariant on every webhook
+  delivery: if it ever finds more than one ACTIVE Telegram `ChannelAccount` across
+  organizations (which should be unreachable given the guard above, but could still happen
+  via direct DB access or a future regression), it logs an error and rejects the request
+  (`409`) instead of silently routing the message to an arbitrary organization. Multiple
+  organizations each running their own Telegram bot therefore remains a **post-MVP gap**
+  (this deployment can only ever support ONE organization's Telegram bot at a time) — the
+  real fix is per-org credential storage plus either per-org webhook paths (e.g.
+  `/api/channels/telegram/webhook/[channelAccountId]`) or looking up the bot id via `getMe`
+  per request and matching `ChannelAccount.externalAccountId`. See
+  `src/server/actions/telegram.test.ts` and
+  `src/app/api/channels/telegram/webhook/route.test.ts` for the tests proving both the
+  registration-time block and the webhook-routing-time safety net.
 - **No delivery receipts.** Telegram has no polling delivery-status API for regular bot
   messages, and this MVP wires no separate read-receipt webhook — `TelegramAdapter.getDeliveryStatus`
   always returns `null`. A sent message's terminal *tracked* status is `SENT`

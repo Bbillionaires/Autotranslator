@@ -18,6 +18,7 @@ const { organizationRepository } = await import("@/server/repositories/organizat
 const { channelAccountRepository } = await import("@/server/repositories/channelAccountRepository");
 const { contactChannelIdentityRepository } = await import("@/server/repositories/contactChannelIdentityRepository");
 const { registerChannelAdapters } = await import("@/server/channels");
+const { WEBHOOK_RATE_LIMIT } = await import("@/server/rateLimit");
 const { POST } = await import("./route");
 
 registerChannelAdapters();
@@ -50,9 +51,10 @@ async function setUpOrgAndChannel() {
   return { organization, channelAccount };
 }
 
-function buildRequest(body: unknown, secret: string | null = "test-webhook-secret"): Request {
+function buildRequest(body: unknown, secret: string | null = "test-webhook-secret", ip?: string): Request {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (secret !== null) headers["X-Telegram-Bot-Api-Secret-Token"] = secret;
+  if (ip) headers["X-Forwarded-For"] = ip;
   return new Request("https://example.com/api/channels/telegram/webhook", {
     method: "POST",
     headers,
@@ -71,6 +73,22 @@ describe("POST /api/channels/telegram/webhook — webhook validation", () => {
   it("rejects a webhook with no secret token header (401)", async () => {
     const res = await POST(buildRequest({ update_id: 1 }, null));
     expect(res.status).toBe(401);
+  });
+});
+
+describe("POST /api/channels/telegram/webhook — H2 rate limiting", () => {
+  it("returns 429 once a single IP exceeds the webhook rate limit, before any signature validation runs", async () => {
+    const ip = `203.0.113.${Math.floor(Math.random() * 200) + 1}`; // unique per test run, isolated from other tests' shared "unknown" bucket
+
+    for (let i = 0; i < WEBHOOK_RATE_LIMIT.limit; i++) {
+      // Deliberately using a WRONG secret token here — proves the rate limit is enforced
+      // BEFORE signature validation (a flood of garbage requests is still bounded).
+      const res = await POST(buildRequest({ update_id: i }, "wrong-secret", ip));
+      expect(res.status).toBe(401);
+    }
+
+    const limited = await POST(buildRequest({ update_id: 9999 }, "wrong-secret", ip));
+    expect(limited.status).toBe(429);
   });
 });
 
@@ -131,6 +149,32 @@ describe("POST /api/channels/telegram/webhook — regular messages", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { ignored?: string };
     expect(body.ignored).toBe("no_channel_account");
+  });
+
+  it("C1 safety net: rejects (does not silently route) when more than one org somehow has an ACTIVE Telegram ChannelAccount", async () => {
+    // `registerTelegramWebhook` blocks this from happening via the normal app flow — this
+    // simulates the "should be impossible" case (e.g. direct DB access, a future
+    // regression) via direct repository calls, proving the webhook route fails loud rather
+    // than silently picking a winner and leaking data cross-org.
+    const orgA = await organizationRepository.create({ name: `Telegram C1 Route Org A ${Date.now()}-${Math.random()}` });
+    const orgB = await organizationRepository.create({ name: `Telegram C1 Route Org B ${Date.now()}-${Math.random()}` });
+    organizationId = orgA.id; // cleaned up in afterEach; orgB cleaned up explicitly below (try/finally)
+
+    try {
+      await channelAccountRepository.create(orgA.id, { channelType: "TELEGRAM", displayName: "Org A Bot", status: "ACTIVE" });
+      await channelAccountRepository.create(orgB.id, { channelType: "TELEGRAM", displayName: "Org B Bot", status: "ACTIVE" });
+
+      const update = { update_id: 400, message: { message_id: 1, chat: { id: 5001, type: "private" }, text: "hi", date: now() } };
+      const res = await POST(buildRequest(update));
+
+      expect(res.status).toBe(409);
+      const messageCount = await prisma.message.count({ where: { organizationId: { in: [orgA.id, orgB.id] } } });
+      expect(messageCount).toBe(0); // no message was ever routed to either org
+    } finally {
+      // try/finally, not just afterEach, so a failed assertion never leaves a second org's
+      // ACTIVE Telegram ChannelAccount behind to poison every other test in this file/suite.
+      await prisma.organization.deleteMany({ where: { id: orgB.id } });
+    }
   });
 });
 

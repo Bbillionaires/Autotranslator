@@ -13,18 +13,15 @@ import NextAuth from "next-auth";
 import type { EmailConfig } from "@auth/core/providers/email";
 import { PrismaAdapter } from "@auth/prisma-adapter";
 import Credentials from "next-auth/providers/credentials";
-import bcrypt from "bcryptjs";
-import { z } from "zod";
 import { prisma } from "./db";
 import { logger } from "./logger";
+import { verifyCredentials } from "./credentialsAuth";
 import { userRepository } from "./repositories/userRepository";
 import type { Role } from "@prisma/client";
 import "./auth.types";
 
-const credentialsSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(1),
-});
+export { verifyCredentials } from "./credentialsAuth";
+export type { AuthorizedCredentialsUser } from "./credentialsAuth";
 
 /**
  * A minimal Auth.js "email" (magic link) provider that logs the sign-in link to the
@@ -53,13 +50,15 @@ function devConsoleEmailProvider(): EmailConfig {
 // scopes email uniqueness to `@@unique([organizationId, email])` (email is only unique
 // *within* an org — see docs/implementation-plan.md §4), so that call throws a
 // PrismaClientValidationError at runtime. Override just this one method with a
-// `findFirst`-based lookup (see userRepository.findByEmail for the "not org-scoped by
-// design" rationale) — every other adapter method already keys off a genuinely unique
-// column (id, sessionToken, provider+providerAccountId, identifier+token) and needs no
-// change. Note: self-service sign-up via an unrecognized email is not a supported flow
-// (this product is invite-only per the plan) — `createUser` would fail against our schema
-// (organizationId/name are required) if ever reached for a brand-new email; that's
-// intentional, not a bug to fix here.
+// `findMany`-then-disambiguate lookup (see userRepository.findByEmail's doc comment for the
+// "not org-scoped by design" rationale AND the M3 fix: throws instead of silently picking
+// an arbitrary match when the same email exists in more than one org) — every other adapter
+// method already keys off a genuinely unique column (id, sessionToken,
+// provider+providerAccountId, identifier+token) and needs no change. Note: self-service
+// sign-up via an unrecognized email is not a supported flow (this product is invite-only
+// per the plan) — `createUser` would fail against our schema (organizationId/name are
+// required) if ever reached for a brand-new email; that's intentional, not a bug to fix
+// here.
 const prismaAdapter = PrismaAdapter(prisma);
 const adapter = {
   ...prismaAdapter,
@@ -79,31 +78,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         email: { label: "Email", type: "email" },
         password: { label: "Password", type: "password" },
       },
-      async authorize(rawCredentials) {
-        const parsed = credentialsSchema.safeParse(rawCredentials);
-        if (!parsed.success) {
-          return null;
-        }
-        const { email, password } = parsed.data;
-
-        const user = await prisma.user.findFirst({ where: { email } });
-        if (!user || !user.passwordHash) {
-          return null;
-        }
-
-        const passwordMatches = await bcrypt.compare(password, user.passwordHash);
-        if (!passwordMatches) {
-          return null;
-        }
-
-        return {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          image: user.image,
-          organizationId: user.organizationId,
-          role: user.role,
-        };
+      async authorize(rawCredentials, request) {
+        return verifyCredentials(rawCredentials, request);
       },
     }),
     devConsoleEmailProvider(),

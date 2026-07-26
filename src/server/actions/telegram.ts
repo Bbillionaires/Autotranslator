@@ -18,7 +18,8 @@ import { auth } from "../auth";
 import { channelAdapterRegistry } from "../channels";
 import type { TelegramAdapter } from "../channels/telegram/adapter";
 import { env } from "../env";
-import { NotConfiguredError, UpstreamAdapterError, toSafeActionError } from "../errors";
+import { ConflictError, NotConfiguredError, UpstreamAdapterError, toSafeActionError } from "../errors";
+import { auditLogRepository } from "../repositories/auditLogRepository";
 import { channelAccountRepository } from "../repositories/channelAccountRepository";
 import { requireRole } from "../roles";
 
@@ -93,6 +94,20 @@ export interface RegisterTelegramWebhookResult {
  * ACTIVE `ChannelAccount` of type TELEGRAM exists for the caller's org (creating one, keyed
  * by the bot's own id/username via `getMe`, if none exists yet). This is the "connect a
  * Telegram bot" action the minimal Settings UI section exposes.
+ *
+ * ## C1 fix — single-tenant-per-deployment guard (docs/review-report.md)
+ * This deployment has exactly one global `TELEGRAM_BOT_TOKEN`/webhook URL, so at most one
+ * organization can safely own the ACTIVE Telegram `ChannelAccount` the inbound webhook
+ * route resolves against (see that route's `resolveTelegramChannelAccount`). Before ever
+ * creating a NEW `ChannelAccount` for this org, we check — across ALL organizations, not
+ * just the caller's own — whether a DIFFERENT organization already has an ACTIVE Telegram
+ * `ChannelAccount`. If so, this call is hard-rejected with a `ConflictError` BEFORE calling
+ * Telegram's API at all (no side effects, no wasted network call, immediate clear
+ * feedback). This is deliberately NOT scoped to "only when a new row would be created" via
+ * a race-prone check-then-act against the DB unique constraint — `ChannelAccount` has no
+ * unique constraint on `(channelType, status)` globally, so this is an application-level
+ * guard, not a DB-level one; acceptable because registration is a low-frequency,
+ * admin-only, session-authenticated action (not a hot path needing DB-level atomicity).
  */
 export async function registerTelegramWebhook(): Promise<ActionResult<RegisterTelegramWebhookResult>> {
   try {
@@ -104,6 +119,23 @@ export async function registerTelegramWebhook(): Promise<ActionResult<RegisterTe
     }
     if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_WEBHOOK_SECRET) {
       throw new NotConfiguredError("TELEGRAM_BOT_TOKEN and TELEGRAM_WEBHOOK_SECRET must both be set.");
+    }
+
+    const organizationId = session!.user.organizationId;
+    const existing = await channelAccountRepository.listByChannelType(organizationId, "TELEGRAM");
+    const willCreateNewAccount = existing.length === 0;
+
+    if (willCreateNewAccount) {
+      const conflictingAccount = await channelAccountRepository.findFirstActiveByChannelTypeInOtherOrg(
+        "TELEGRAM",
+        organizationId,
+      );
+      if (conflictingAccount) {
+        throw new ConflictError(
+          "This deployment's Telegram bot is already connected to another organization. Multi-org Telegram requires per-org bot tokens, not yet supported.",
+          { organizationId, conflictingOrganizationId: conflictingAccount.organizationId },
+        );
+      }
     }
 
     const url = webhookUrl();
@@ -119,16 +151,24 @@ export async function registerTelegramWebhook(): Promise<ActionResult<RegisterTe
       });
     }
 
-    const organizationId = session!.user.organizationId;
-    const existing = await channelAccountRepository.listByChannelType(organizationId, "TELEGRAM");
-    if (existing.length === 0) {
+    if (willCreateNewAccount) {
       const adapter = channelAdapterRegistry.get("TELEGRAM") as TelegramAdapter | undefined;
       const botInfo = adapter ? await adapter.getBotInfo() : null;
-      await channelAccountRepository.create(organizationId, {
+      const channelAccount = await channelAccountRepository.create(organizationId, {
         channelType: "TELEGRAM",
         displayName: botInfo?.username ? `@${botInfo.username}` : "Telegram Bot",
         externalAccountId: botInfo ? String(botInfo.id) : undefined,
         status: "ACTIVE",
+      });
+
+      // M1: channel account connect is an audited mutation per §6.8.
+      await auditLogRepository.record({
+        organizationId,
+        userId: session!.user.id,
+        action: "channel_account.connected",
+        entityType: "ChannelAccount",
+        entityId: channelAccount.id,
+        metadata: { channelType: "TELEGRAM", displayName: channelAccount.displayName },
       });
     }
 

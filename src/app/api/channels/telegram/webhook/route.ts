@@ -7,10 +7,20 @@
  *     against `TELEGRAM_WEBHOOK_SECRET`. Invalid/missing -> `401`, no DB write.
  *  2. Resolve the `ChannelAccount` this webhook belongs to. This MVP supports exactly one
  *     global Telegram bot token (`env.TELEGRAM_BOT_TOKEN`), so resolution is simply "the
- *     first ACTIVE Telegram ChannelAccount" (`channelAccountRepository.findFirstActiveByChannelType`)
- *     — deliberately NOT a `getMe` network round-trip on every webhook delivery. Real
- *     multi-org Telegram support (distinct bot tokens per organization) is a documented
- *     post-MVP gap; see docs/channel-adapters.md.
+ *     sole ACTIVE Telegram ChannelAccount across the whole deployment" — deliberately NOT a
+ *     `getMe` network round-trip on every webhook delivery. Real multi-org Telegram support
+ *     (distinct bot tokens per organization) is a documented post-MVP gap; see
+ *     docs/channel-adapters.md.
+ *
+ *     C1 fix (docs/review-report.md): `registerTelegramWebhook`
+ *     (`src/server/actions/telegram.ts`) now hard-blocks a second organization from ever
+ *     creating a second ACTIVE Telegram ChannelAccount, so under normal operation exactly
+ *     zero or one such row exists across every organization. `resolveTelegramChannelAccount`
+ *     makes that invariant explicit and SAFE rather than assumed: if it ever finds MORE
+ *     THAN ONE active row (which should be impossible given the guard above, but could still
+ *     happen via direct DB access, a bug, or a future regression), it logs an error and
+ *     rejects the request instead of silently picking one — failing loud, not silently
+ *     routing a message to the wrong organization.
  *  3. Bot commands (`/start`, `/language`, `/help`, `/privacy`) and inline-keyboard
  *     `callback_query` (the `/language` picker's selection) are intercepted here, BEFORE
  *     `processInboundMessage()` — they are replied to directly via the adapter and never
@@ -39,16 +49,40 @@ import {
   unknownCommandText,
 } from "@/server/channels/telegram/commands";
 import { normalizeTelegramUpdate, type TelegramCallbackQuery, type TelegramMessage, type TelegramUpdate } from "@/server/channels/telegram/parse";
-import { handleRouteError, ValidationError } from "@/server/errors";
+import { ConflictError, handleRouteError, ValidationError } from "@/server/errors";
 import { withContext } from "@/server/logger";
 import { processInboundMessage } from "@/server/messaging/inboundService";
 import { resolveOrCreateContactAndConversation } from "@/server/messaging/contactResolution";
+import { getClientIp, rateLimitedResponse, webhookRateLimiter } from "@/server/rateLimit";
 import { channelAccountRepository } from "@/server/repositories/channelAccountRepository";
 import { contactRepository } from "@/server/repositories/contactRepository";
 import type { ChannelAccount } from "@prisma/client";
 
+/**
+ * Resolves the sole ACTIVE Telegram `ChannelAccount` across the whole deployment (see the
+ * module doc comment's step 2). Throws `ConflictError` — logged loudly first — if more than
+ * one is ever found, instead of silently picking one (the C1 fix: routing an inbound
+ * message to the wrong organization is a real data-leakage bug, not an acceptable
+ * fallback).
+ */
 async function resolveTelegramChannelAccount(): Promise<ChannelAccount | null> {
-  return channelAccountRepository.findFirstActiveByChannelType("TELEGRAM");
+  const activeAccounts = await channelAccountRepository.listAllActiveByChannelType("TELEGRAM");
+  if (activeAccounts.length === 0) {
+    return null;
+  }
+  if (activeAccounts.length > 1) {
+    withContext({}).error(
+      {
+        count: activeAccounts.length,
+        organizationIds: activeAccounts.map((account) => account.organizationId),
+      },
+      "telegram_webhook_multiple_active_channel_accounts — single-tenant invariant violated, refusing to guess which organization owns this delivery",
+    );
+    throw new ConflictError(
+      "Telegram inbound routing is unsafe: more than one organization has an ACTIVE Telegram channel account in this single-global-bot-token deployment.",
+    );
+  }
+  return activeAccounts[0];
 }
 
 async function handleBotCommand(adapter: TelegramAdapter, channelAccount: ChannelAccount, message: TelegramMessage): Promise<void> {
@@ -116,6 +150,13 @@ export async function POST(req: Request): Promise<Response> {
     // Telegram not enabled in this deployment — inert, matching the WhatsApp adapter's
     // "disabled -> 404/no-op" precedent (§3.2).
     return Response.json({ error: "Telegram channel is not enabled." }, { status: 404 });
+  }
+
+  // H2 fix (docs/review-report.md): rate-limited per-IP, before any signature validation
+  // or DB work — a flood (valid or invalid signature) shouldn't get further than this.
+  const rateLimit = webhookRateLimiter.check(getClientIp(req));
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse();
   }
 
   const isValid = await adapter.validateWebhook(req);

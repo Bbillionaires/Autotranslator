@@ -98,6 +98,46 @@ export class RateLimiter {
 export const gatewayDeviceRateLimiter = new RateLimiter(GATEWAY_DEVICE_RATE_LIMIT);
 export const gatewayRegisterRateLimiter = new RateLimiter(GATEWAY_REGISTER_RATE_LIMIT);
 
+/**
+ * H2 fix (docs/review-report.md): §6.4 explicitly requires rate limiting on all
+ * public/webhook-adjacent endpoints (every channel's inbound webhook route, every
+ * `/api/gateways/...` route) AND the auth sign-in/magic-link-request endpoints — before
+ * this fix, only the six Android gateway routes were covered (per this module's original
+ * doc comment above). These two policies/limiters extend the same generic `RateLimiter` to
+ * the Telegram/WhatsApp webhook routes and the Credentials `authorize()` callback.
+ */
+
+/** Policy for the Telegram/WhatsApp webhook routes — per-IP, generous enough for legitimate retry storms from the channel provider but bounded against a flood. */
+export const WEBHOOK_RATE_LIMIT: RateLimitPolicy = { limit: 120, windowMs: 60_000 };
+
+/** Policy for the Credentials sign-in `authorize()` callback — per-IP+email, tight enough to blunt credential stuffing without locking out a user who just mistypes their password a few times. */
+export const AUTH_RATE_LIMIT: RateLimitPolicy = { limit: 10, windowMs: 60_000 };
+
+export const webhookRateLimiter = new RateLimiter(WEBHOOK_RATE_LIMIT);
+export const authRateLimiter = new RateLimiter(AUTH_RATE_LIMIT);
+
+/**
+ * Best-effort client IP extraction for per-IP rate limiting on endpoints with no other
+ * natural key (webhooks, sign-in) — reads the common reverse-proxy headers
+ * (`x-forwarded-for` first, since most platforms including Vercel set it; `x-real-ip` as a
+ * fallback), falling back to a constant bucket if neither is present (e.g. direct
+ * connections in local dev/tests) rather than throwing. Not spoof-proof against a client
+ * that sets its own `x-forwarded-for` directly to an origin with no trusted reverse proxy
+ * in front of it — acceptable for this MVP's threat model (blunting casual floods, not a
+ * fully trust-verified proxy chain).
+ */
+export function getClientIp(req: Request): string {
+  const forwardedFor = req.headers.get("x-forwarded-for");
+  if (forwardedFor) {
+    return forwardedFor.split(",")[0].trim();
+  }
+  const realIp = req.headers.get("x-real-ip");
+  if (realIp) {
+    return realIp.trim();
+  }
+  return "unknown";
+}
+
 /** Standard 429 response body/status — no detail beyond a generic message, per §6.4/§6.8. */
 export function rateLimitedResponse(): Response {
   return Response.json({ error: "Too many requests." }, { status: 429 });

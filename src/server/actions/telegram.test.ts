@@ -23,13 +23,14 @@ const auth = (await import("../auth")).auth as unknown as () => Promise<Session 
 const { prisma } = await import("../db");
 const { organizationRepository } = await import("../repositories/organizationRepository");
 const { channelAccountRepository } = await import("../repositories/channelAccountRepository");
+const { userRepository } = await import("../repositories/userRepository");
 const { registerChannelAdapters } = await import("../channels");
 const { getTelegramWebhookConfig, getTelegramHealthStatus, registerTelegramWebhook } = await import("./telegram");
 
 registerChannelAdapters();
 
-function fakeSession(role: Session["user"]["role"], organizationId = "org1"): Session {
-  return { user: { id: "u1", organizationId, role }, expires: "" } as Session;
+function fakeSession(role: Session["user"]["role"], organizationId = "org1", userId = "u1"): Session {
+  return { user: { id: userId, organizationId, role }, expires: "" } as Session;
 }
 
 beforeAll(async () => {
@@ -103,7 +104,13 @@ describe("registerTelegramWebhook", () => {
   it("calls Telegram's setWebhook and creates a ChannelAccount when none exists yet", async () => {
     const organization = await organizationRepository.create({ name: `Telegram Action Test Org ${Date.now()}-${Math.random()}` });
     organizationId = organization.id;
-    vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId));
+    const actingUser = await userRepository.create({
+      organizationId,
+      name: "Acting Admin",
+      email: `acting-admin-${Date.now()}-${Math.random()}@test.dev`,
+      role: "ADMINISTRATOR",
+    });
+    vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId, actingUser.id));
 
     const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
       void init;
@@ -130,6 +137,73 @@ describe("registerTelegramWebhook", () => {
     const body = JSON.parse((setWebhookCall![1] as RequestInit).body as string) as { url: string; secret_token: string };
     expect(body.url).toBe("https://app.example.com/api/channels/telegram/webhook");
     expect(body.secret_token).toBe("test-webhook-secret");
+
+    // M1: channel account connect is audited.
+    const auditRows = await prisma.auditLog.findMany({ where: { organizationId, entityType: "ChannelAccount" } });
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0].action).toBe("channel_account.connected");
+  });
+
+  it("C1: blocks a second organization from activating Telegram while another org already has it active, without calling Telegram's API", async () => {
+    const orgA = await organizationRepository.create({ name: `Telegram C1 Org A ${Date.now()}-${Math.random()}` });
+    const orgB = await organizationRepository.create({ name: `Telegram C1 Org B ${Date.now()}-${Math.random()}` });
+
+    try {
+      const fetchMock = vi.fn(async (url: string | URL) => {
+        if (String(url).includes("/setWebhook")) {
+          return new Response(JSON.stringify({ ok: true, description: "Webhook was set" }), { status: 200 });
+        }
+        if (String(url).includes("/getMe")) {
+          return new Response(JSON.stringify({ ok: true, result: { id: 555, username: "my_bot", first_name: "Bot" } }), { status: 200 });
+        }
+        throw new Error(`Unexpected fetch call: ${url}`);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const adminA = await userRepository.create({
+        organizationId: orgA.id,
+        name: "Admin A",
+        email: `admin-a-${Date.now()}-${Math.random()}@test.dev`,
+        role: "ADMINISTRATOR",
+      });
+      const adminB = await userRepository.create({
+        organizationId: orgB.id,
+        name: "Admin B",
+        email: `admin-b-${Date.now()}-${Math.random()}@test.dev`,
+        role: "ADMINISTRATOR",
+      });
+
+      // Org A registers first — succeeds, exactly as the earlier test proves.
+      vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", orgA.id, adminA.id));
+      const first = await registerTelegramWebhook();
+      expect(first.ok).toBe(true);
+      const setWebhookCallsAfterOrgA = fetchMock.mock.calls.filter(([url]) => String(url).includes("/setWebhook")).length;
+
+      // Org B attempts to register second — must be hard-blocked with a clear conflict error,
+      // and must NOT create a ChannelAccount for Org B, and must NOT even call Telegram's API.
+      vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", orgB.id, adminB.id));
+      const second = await registerTelegramWebhook();
+      expect(second.ok).toBe(false);
+      if (!second.ok) {
+        expect(second.message).toMatch(/already connected to another organization/i);
+        expect(second.code).toBe("CONFLICT");
+      }
+
+      const setWebhookCallsAfterOrgB = fetchMock.mock.calls.filter(([url]) => String(url).includes("/setWebhook")).length;
+      expect(setWebhookCallsAfterOrgB).toBe(setWebhookCallsAfterOrgA); // no additional setWebhook call was made for Org B
+
+      const orgBAccounts = await channelAccountRepository.listByChannelType(orgB.id, "TELEGRAM");
+      expect(orgBAccounts).toHaveLength(0);
+
+      const orgAAccounts = await channelAccountRepository.listByChannelType(orgA.id, "TELEGRAM");
+      expect(orgAAccounts).toHaveLength(1);
+      expect(orgAAccounts[0].status).toBe("ACTIVE");
+    } finally {
+      // try/finally (not just afterEach) so a leftover ACTIVE Telegram ChannelAccount from
+      // an assertion failure never leaks into other tests/files sharing this DB (an earlier
+      // draft of this test learned that lesson the hard way).
+      await prisma.organization.deleteMany({ where: { id: { in: [orgA.id, orgB.id] } } });
+    }
   });
 
   it("surfaces an UpstreamAdapterError-derived message when Telegram's setWebhook call fails", async () => {

@@ -21,6 +21,7 @@ const { channelAccountRepository } = await import("@/server/repositories/channel
 const { contactChannelIdentityRepository } = await import("@/server/repositories/contactChannelIdentityRepository");
 const { messageEventRepository } = await import("@/server/repositories/messageEventRepository");
 const { registerChannelAdapters } = await import("@/server/channels");
+const { WEBHOOK_RATE_LIMIT } = await import("@/server/rateLimit");
 const { GET, POST } = await import("./route");
 
 registerChannelAdapters();
@@ -53,12 +54,13 @@ async function setUpOrgAndChannel(phoneNumberId = "1234567890") {
   return { organization, channelAccount };
 }
 
-function signedPostRequest(body: unknown, secret: string | null = "test-app-secret"): Request {
+function signedPostRequest(body: unknown, secret: string | null = "test-app-secret", ip?: string): Request {
   const raw = JSON.stringify(body);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (secret !== null) {
     headers["X-Hub-Signature-256"] = `sha256=${createHmac("sha256", secret).update(raw).digest("hex")}`;
   }
+  if (ip) headers["X-Forwarded-For"] = ip;
   return new Request("https://example.com/api/channels/whatsapp/webhook", { method: "POST", headers, body: raw });
 }
 
@@ -239,5 +241,36 @@ describe("POST /api/channels/whatsapp/webhook — delivery status callbacks", ()
     // And the duplicate must not have regressed status back from READ.
     const final = await prisma.message.findUniqueOrThrow({ where: { id: message.id } });
     expect(final.status).toBe("READ");
+  });
+});
+
+describe("H2 rate limiting", () => {
+  it("POST returns 429 once a single IP exceeds the webhook rate limit, before signature validation runs", async () => {
+    const ip = `198.51.100.${Math.floor(Math.random() * 200) + 1}`;
+
+    for (let i = 0; i < WEBHOOK_RATE_LIMIT.limit; i++) {
+      // Wrong secret — proves the limit is enforced before signature validation.
+      const res = await POST(signedPostRequest({ object: "whatsapp_business_account", entry: [] }, "wrong-secret", ip));
+      expect(res.status).toBe(401);
+    }
+
+    const limited = await POST(signedPostRequest({ object: "whatsapp_business_account", entry: [] }, "wrong-secret", ip));
+    expect(limited.status).toBe(429);
+  });
+
+  it("GET (verify handshake) returns 429 once a single IP exceeds the webhook rate limit", async () => {
+    const ip = `198.51.100.${Math.floor(Math.random() * 200) + 1}`;
+    const buildVerifyRequest = () =>
+      new Request("https://example.com/api/channels/whatsapp/webhook?hub.mode=subscribe&hub.verify_token=wrong-token&hub.challenge=1", {
+        headers: { "X-Forwarded-For": ip },
+      });
+
+    for (let i = 0; i < WEBHOOK_RATE_LIMIT.limit; i++) {
+      const res = await GET(buildVerifyRequest());
+      expect(res.status).toBe(403);
+    }
+
+    const limited = await GET(buildVerifyRequest());
+    expect(limited.status).toBe(429);
   });
 });
