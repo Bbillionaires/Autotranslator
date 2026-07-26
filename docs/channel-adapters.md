@@ -372,10 +372,175 @@ Response `200`:
   this channel's terminal *tracked* status, same precedent as Telegram's `getDeliveryStatus`
   always returning `null`.
 
-## WhatsApp Business Cloud API (Phase 9 — not yet implemented)
+## WhatsApp Business Cloud API (Phase 9 — fully implemented, gated behind `WHATSAPP_ENABLED`)
 
-Placeholder — Phase 9 will document: creating a Meta Business Manager account and App,
-adding the WhatsApp product, obtaining `WHATSAPP_ACCESS_TOKEN`/`WHATSAPP_PHONE_NUMBER_ID`/
-`WHATSAPP_BUSINESS_ACCOUNT_ID`/`WHATSAPP_APP_SECRET`, choosing `WHATSAPP_VERIFY_TOKEN`, the
-GET-verify webhook handshake, and Business Verification/App Review requirements for
-production traffic.
+The official WhatsApp Business **Cloud API** (Meta's own hosted Graph API product) — never
+an unofficial browser-automation/session-hijacking approach. `WHATSAPP_ENABLED` defaults to
+`false`; with it unset or `false`, **zero** `WHATSAPP_*` env vars are required
+(`src/server/env.ts`'s conditional-requirement logic — see `env.test.ts`), `WhatsAppAdapter`
+is never constructed/registered (`src/server/channels/index.ts`), and both webhook routes
+are inert: `GET /api/channels/whatsapp/webhook` and `POST /api/channels/whatsapp/webhook`
+return a bare `404`, and `GET /api/channels/whatsapp/health` returns
+`{ enabled: false, healthy: false, ... }` with a `200` (never an error) rather than throwing.
+
+**Everything below this point is external, human, Meta-side setup.** None of it can be
+performed by this application's code — there is no API this codebase can call on your
+behalf to create a Meta Business account, add the WhatsApp product to an App, or get a
+production number verified. You (a human, in the Meta dashboards) must do every step; the
+app only needs the resulting credentials pasted into its env vars afterward.
+
+### 1. Create a Meta Business Manager account and App
+
+1. Go to [business.facebook.com](https://business.facebook.com) and create (or reuse) a
+   **Meta Business Manager** account for your organization.
+2. In [developers.facebook.com](https://developers.facebook.com), create a new **App**
+   (type: "Business"), associated with that Business Manager account.
+3. In the App dashboard, add the **WhatsApp** product. Meta automatically provisions a
+   **test phone number** and a **test WhatsApp Business Account (WABA)** you can send/receive
+   messages with immediately, at no cost, to up to 5 pre-verified recipient numbers — this
+   is enough to develop and test this entire adapter end-to-end without any further
+   verification step.
+
+### 2. App Review / Business Verification (required for production traffic)
+
+The test number above is permanently limited to 5 recipient phone numbers you manually add
+and verify in the dashboard, and to Meta's own test templates. To send messages to
+*arbitrary* real customers in production, Meta requires:
+
+- **Business Verification** — proving the Business Manager account represents a real,
+  legitimate business (business documents, a matching domain, etc.). This can take anywhere
+  from under a day to several weeks depending on Meta's review queue and how complete your
+  submission is.
+- **App Review** for the specific WhatsApp permissions this integration uses
+  (`whatsapp_business_messaging`, `whatsapp_business_management`), which requires a screen
+  recording/demo of the actual use case.
+- A **production phone number** added to the WABA (a real number you own or a virtual
+  number purchased through a Meta-supported provider), which itself requires phone-number
+  verification (an SMS/voice code sent by Meta).
+
+None of this is a code change — it is entirely dashboard/paperwork on Meta's side. Budget
+real calendar time for it before committing to a production launch date.
+
+### 3. Obtain the four credential env vars
+
+From the App dashboard, under WhatsApp → API Setup (or WhatsApp → Configuration once past
+the test-number stage):
+
+- `WHATSAPP_PHONE_NUMBER_ID` — the numeric id of the specific WhatsApp phone number (test or
+  production) you're sending from. This is what `WhatsAppAdapter` puts in the Graph API URL
+  (`https://graph.facebook.com/v21.0/<WHATSAPP_PHONE_NUMBER_ID>/messages`) and what the
+  webhook route uses to resolve which `ChannelAccount` an inbound delivery belongs to (see
+  "Known limitations" below).
+- `WHATSAPP_BUSINESS_ACCOUNT_ID` — the WABA id itself (one level up from the phone number;
+  a WABA can own multiple phone numbers). Not currently used by any Graph API call this
+  adapter makes, but recorded per §7's required-credentials list for completeness and future
+  use (e.g. querying/managing message templates via the WABA-level endpoints).
+- `WHATSAPP_ACCESS_TOKEN` — a token authorizing calls against the above. For development,
+  the dashboard's "Temporary access token" (valid ~24h) is enough to exercise everything in
+  this guide; for anything longer-lived, generate a **System User** access token (Business
+  Settings → System Users) scoped to the `whatsapp_business_messaging`/
+  `whatsapp_business_management` permissions — System User tokens don't expire on a fixed
+  clock the way a personal access token does, and aren't tied to a human's Meta login
+  session.
+- `WHATSAPP_APP_SECRET` — the App's secret, found under App Settings → Basic. This is the
+  HMAC key `WhatsAppAdapter.validateWebhook` uses to verify `X-Hub-Signature-256` on every
+  inbound webhook delivery — treat it exactly like the Telegram bot token: never commit it,
+  rotate it if it leaks (rotating immediately invalidates every previously-computed
+  signature, so do this in a maintenance window, not silently).
+
+### 4. Choose `WHATSAPP_VERIFY_TOKEN` and register the webhook
+
+`WHATSAPP_VERIFY_TOKEN` is **self-chosen** (like `TELEGRAM_WEBHOOK_SECRET`) — generate a
+random string (`openssl rand -hex 32`) and set it as an env var. Then, in the App dashboard
+under WhatsApp → Configuration → Webhook:
+
+1. Set the **Callback URL** to `<APP_URL>/api/channels/whatsapp/webhook`.
+2. Set the **Verify Token** field to the exact same value as `WHATSAPP_VERIFY_TOKEN`.
+3. Click **Verify and Save** — Meta immediately issues a `GET` request to your callback URL
+   with `?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`; `WhatsAppAdapter`'s
+   route (`src/app/api/channels/whatsapp/webhook/route.ts`'s `GET` handler) must be publicly
+   reachable over HTTPS at that moment (same tunneling note as Telegram's setup — see that
+   section above for `ngrok`/`cloudflared` instructions if developing locally) and must
+   return the raw `hub.challenge` value as plain text with `200`, which it does once the
+   verify token matches.
+4. Subscribe to the **`messages`** webhook field (this is what delivers both inbound
+   messages and delivery-status callbacks — Meta doesn't separate them into different
+   fields).
+
+Set `WHATSAPP_ENABLED="true"` and restart the app so `registerChannelAdapters()` picks up
+`WhatsAppAdapter` (`src/server/channels/index.ts`) — until you do, the webhook route stays
+`404` even with every other var correctly set (by design: enabling the adapter is a single,
+explicit flag flip, not implied by "some WhatsApp env vars happen to be present").
+
+You'll also need at least one `ChannelAccount` row of type `WHATSAPP` with
+`externalAccountId` set to your `WHATSAPP_PHONE_NUMBER_ID` and `status: ACTIVE` for the
+webhook route to resolve inbound deliveries against (see "Known limitations" below — there
+is currently no Settings UI/Server Action to create this row, unlike Telegram's "Register
+webhook now" button; create it directly via Prisma/`channelAccountRepository.create` for
+now).
+
+### 5. Message templates (required to *initiate* conversations)
+
+WhatsApp only allows a business to send a **free-form text message** (what
+`WhatsAppAdapter.sendMessage` sends) within the **24-hour customer service window** — i.e.
+in reply to a message the customer sent you within the last 24 hours. To message a customer
+*first*, or to resume a conversation after that window closes, Meta requires a
+pre-approved **message template** (a fixed-structure message with named variable slots,
+e.g. "Your order {{1}} has shipped"), submitted for review in the App dashboard under
+WhatsApp → Message Templates. Template review typically takes minutes to a few hours and can
+be rejected for category-mismatch or promotional-content-in-a-utility-template reasons — plan
+for at least one rejection-and-resubmit cycle the first time.
+
+`WhatsAppAdapter.sendTemplateMessage` (an adapter-specific extension method, not part of the
+shared `MessagingChannelAdapter` interface — see that method's doc comment for why)
+implements the correct Graph API request shape (`type: "template"`, `template.name`,
+`template.language.code`, optional `template.components` for variable substitution) and its
+response/error handling. **No template is registered on any real WABA in this sandbox** —
+there is nothing to test this against live, so it is exercised only against a mocked `fetch`
+in `adapter.test.ts`. Wiring a real "is the 24h window open, and if not, which template do I
+send" decision into the outbound lifecycle (§3.6) is a documented **post-MVP gap**, not
+built in this phase.
+
+### Delivery-status callbacks
+
+Unlike Telegram/Android, WhatsApp DOES deliver delivery-status callbacks — `sent`,
+`delivered`, `read`, and `failed` — as `statuses[]` entries on the same `messages` webhook
+field inbound messages arrive on. These are handled by a dedicated module,
+`src/server/messaging/deliveryStatusService.ts`, called from a distinct branch in the
+webhook route (not folded into `processInboundMessage`, since a status callback updates an
+EXISTING outbound `Message` rather than creating a new one — see that module's doc comment
+for the full design rationale). Idempotency is enforced via a derived
+`${whatsappMessageId}:${status}:${timestamp}` key stored as `MessageEvent.externalEventId`,
+so a Meta webhook retry delivering the identical callback twice never double-records.
+`WhatsAppAdapter.getDeliveryStatus()` itself always returns `null` — there is no pull/polling
+API for this either; the webhook is the only source, same precedent as Telegram/Android.
+
+### Known limitations (documented, not hidden)
+
+- **One global WhatsApp phone number per deployment, resolved from `phone_number_id` in the
+  payload.** Unlike Telegram's "just grab the first ACTIVE ChannelAccount of this type"
+  shortcut, the WhatsApp webhook route resolves the correct `ChannelAccount` per webhook
+  `value` block via `channelAccountRepository.findActiveByChannelTypeAndExternalAccountId`
+  keyed on `phone_number_id` — so multiple WhatsApp Business phone numbers *could* each map
+  to their own `ChannelAccount` in principle, but there is currently no UI/Server Action to
+  create/manage those rows (see below), so in practice this MVP still only exercises one.
+- **No "connect WhatsApp" Settings UI/Server Action.** Unlike Telegram's "Register webhook
+  now" button (which calls `setWebhook` and creates the `ChannelAccount` for you),
+  registering the webhook with Meta is entirely dashboard-driven (step 4 above) and there is
+  currently no in-app action to create the corresponding `ChannelAccount` row afterward — a
+  natural, low-risk follow-up (the Settings section, `whatsapp-section.tsx`, only surfaces
+  health status today, matching the Phase 9 task brief's "keep this small").
+- **No template-selection/24h-window logic wired into the outbound lifecycle.**
+  `sendTemplateMessage` exists and is tested in isolation (mocked `fetch`), but nothing in
+  `src/server/messaging/outboundService.ts` yet decides "is this contact's 24h window open,
+  and if not, which approved template do I send instead of a plain text message" — a
+  documented post-MVP gap, same spirit as cross-channel contact merging (§7 of the
+  implementation plan).
+- **Rich media (image/audio/document/location/etc.) inbound messages are not translated —
+  they're normalized to a bracketed placeholder** (e.g. `[unsupported WhatsApp message type:
+  image]`) so a human agent still sees *something* arrived, rather than being silently
+  dropped. Downloading/relaying the actual media is out of scope for this MVP.
+- **No delivery read receipts for OUTBOUND Android/Telegram-style "did they read it"
+  beyond WhatsApp's own `read` status callback** — this one is actually better than
+  Telegram/Android here (WhatsApp does tell you), it's called out only for symmetry with the
+  other two adapters' equivalent notes.

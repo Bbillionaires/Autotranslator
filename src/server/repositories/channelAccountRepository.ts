@@ -70,6 +70,31 @@ export const channelAccountRepository = {
   },
 
   /**
+   * Cross-org lookup by channel type + `externalAccountId` — the WhatsApp analogue of
+   * `findFirstActiveByChannelType` above. Used ONLY by the WhatsApp webhook route
+   * (`src/app/api/channels/whatsapp/webhook/route.ts`) to resolve which organization's
+   * `ChannelAccount` an inbound webhook `value` block belongs to, via
+   * `value.metadata.phone_number_id` (§3.5 step 2: "for WhatsApp, the phone_number_id in the
+   * payload") — deliberately per-`phone_number_id`, unlike Telegram's single-global-bot-token
+   * shortcut, since a deployment could in principle have multiple WhatsApp Business phone
+   * numbers each mapped to its own `ChannelAccount.externalAccountId`. Still a documented
+   * MVP simplification in the sense that it doesn't disambiguate two different
+   * *organizations* both somehow registering the same real phone number (shouldn't happen —
+   * a phone number belongs to exactly one WhatsApp Business Account — but nothing in this
+   * schema enforces global uniqueness of `externalAccountId` across orgs).
+   */
+  async findActiveByChannelTypeAndExternalAccountId(
+    channelType: ChannelType,
+    externalAccountId: string,
+    client: PrismaClientOrTx = prisma,
+  ) {
+    return client.channelAccount.findFirst({
+      where: { channelType, externalAccountId, status: "ACTIVE" },
+      orderBy: { createdAt: "asc" },
+    });
+  },
+
+  /**
    * All ACTIVE, non-revoked `ChannelAccount`s of a given channel type across every
    * organization. Cross-org for the same reason as `findById` above — used by
    * `AndroidSmsAdapter.healthCheck()` (the parameterless, interface-required method) to

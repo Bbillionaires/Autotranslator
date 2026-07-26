@@ -192,8 +192,16 @@ companion Android app's build specification (permissions, foreground service, ba
 optimization, retry behavior, carrier limitations, privacy disclosure). No Kotlin app ships
 in this repo yet — those two documents are the complete spec for building one.
 
-WhatsApp (Phase 9) is the one section of `docs/channel-adapters.md` still a placeholder
-until that phase lands.
+**WhatsApp Business Cloud API is fully implemented, gated behind `WHATSAPP_ENABLED`
+(Phase 9)** — the official Meta Graph API (never unofficial browser
+automation/session-hijacking), with real `X-Hub-Signature-256` webhook signature
+validation and the GET-verify subscription handshake. With `WHATSAPP_ENABLED` unset/false
+(the default), zero `WHATSAPP_*` env vars are required and both webhook routes are inert
+(`404`); see the "WhatsApp Business Cloud API" section of
+[`docs/channel-adapters.md`](./docs/channel-adapters.md) for the full, entirely-external,
+Meta-side setup checklist (Business Manager account, App Review/Business Verification,
+obtaining credentials, registering the webhook, and message-template approval) — none of
+which this codebase can perform on your behalf.
 
 ## Multi-tenancy, security, and architecture notes
 

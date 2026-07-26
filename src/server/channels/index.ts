@@ -1,12 +1,12 @@
 /**
  * Boot-time channel adapter registration, per docs/implementation-plan.md §3.2.
  *
- * This is the extension point later phases hook into. Import and call `registerChannelAdapters()`
- * once at app boot (e.g. from a Next.js instrumentation hook).
- *
- *   // Phase 9:
- *   import { WhatsAppAdapter } from "./whatsapp";
- *   if (env.WHATSAPP_ENABLED) channelAdapterRegistry.register(new WhatsAppAdapter());
+ * Import and call `registerChannelAdapters()` once at app boot (e.g. from a Next.js
+ * instrumentation hook) to populate the shared registry with every REAL, enabled adapter:
+ * Telegram (`TELEGRAM_ENABLED`), Android SMS gateway (`ANDROID_GATEWAY_ENABLED`), and
+ * WhatsApp (`WHATSAPP_ENABLED`) — each guarded on its own flag, defaulting to `false`, so
+ * the app boots cleanly and every disabled channel's adapter/routes stay inert with zero
+ * of that channel's env vars set (§6.7).
  *
  * The `FakeChannelAdapter` in `./__tests__/fakeAdapter.ts` is NOT registered here — it is
  * test-only and each test wires it directly via `channelAdapterRegistry.registerOverride(...)`
@@ -17,6 +17,7 @@ import { env } from "../env";
 import { AndroidSmsAdapter } from "./androidSms/adapter";
 import { channelAdapterRegistry } from "./registry";
 import { TelegramAdapter } from "./telegram/adapter";
+import { WhatsAppAdapter } from "./whatsapp/adapter";
 
 export { channelAdapterRegistry };
 export * from "./types";
@@ -26,9 +27,6 @@ export * from "./types";
  * multiple times — each real adapter guards on its own `*_ENABLED` flag and on not already
  * being registered, so a repeated call (e.g. from a hot-reloaded dev server) is a no-op
  * rather than a `ConflictError`.
- *
- * Phase 9 adds its `if (env.WHATSAPP_ENABLED) channelAdapterRegistry.register(new WhatsAppAdapter())`
- * call here, following the exact same guarded pattern as Telegram/Android below.
  */
 export function registerChannelAdapters(): void {
   if (env.TELEGRAM_ENABLED && !channelAdapterRegistry.has("TELEGRAM")) {
@@ -36,5 +34,11 @@ export function registerChannelAdapters(): void {
   }
   if (env.ANDROID_GATEWAY_ENABLED && !channelAdapterRegistry.has("ANDROID_SMS")) {
     channelAdapterRegistry.register(new AndroidSmsAdapter());
+  }
+  // Phase 9: the entire WhatsApp surface is inert with zero WHATSAPP_* env vars set — this
+  // is the ONLY place `WhatsAppAdapter` is ever constructed/registered, guarded on the same
+  // `*_ENABLED` pattern as every other channel above.
+  if (env.WHATSAPP_ENABLED && !channelAdapterRegistry.has("WHATSAPP")) {
+    channelAdapterRegistry.register(new WhatsAppAdapter());
   }
 }

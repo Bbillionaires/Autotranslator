@@ -63,6 +63,19 @@ export const messageRepository = {
     return client.message.create({ data: input });
   },
 
+  /**
+   * Looks up a `Message` by its `externalMessageId` (indexed but not unique — see
+   * `@@index([externalMessageId])` in the schema), scoped to the caller's org. Used by
+   * `../messaging/deliveryStatusService.ts` to resolve which outbound `Message` a WhatsApp
+   * `statuses[]` webhook callback (keyed by the WhatsApp message id) refers to. Returns the
+   * first match; in the extremely unlikely event of a collision within one org (this MVP
+   * doesn't enforce uniqueness on this column), the caller gets a deterministic pick rather
+   * than an error.
+   */
+  async findByExternalMessageId(organizationId: string, externalMessageId: string, client: PrismaClientOrTx = prisma) {
+    return client.message.findFirst({ where: { organizationId, externalMessageId } });
+  },
+
   async updateStatus(
     organizationId: string,
     id: string,

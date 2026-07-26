@@ -1,13 +1,17 @@
 /**
- * Channel integrations list — Phase 7 ("channel integrations list (Telegram section already
- * exists from Phase 6 — keep it, add Android/WhatsApp as 'not yet configured' placeholders
- * that later phases will fill in)"). No client state needed for the placeholders themselves
- * — they're static until Phase 8/9 land.
+ * Channel integrations list — Phase 7 originally added Telegram (real) plus Android/WhatsApp
+ * as "not yet configured" placeholders. Phase 9 replaces the WhatsApp placeholder with its
+ * own real (but honest — see `whatsapp-section.tsx`'s doc comment) status section, matching
+ * Telegram's precedent. Android SMS (Phase 8, server-side complete) still shows the generic
+ * placeholder below — Phase 8 never wired a dedicated Settings UI section for it (see
+ * docs/channel-adapters.md's Android "Known limitations": no revoke button either), a
+ * pre-existing gap out of this phase's scope, left as-is rather than silently expanded here.
  */
 import { ChannelIcon } from "@/components/channel-icon";
 import { TelegramSettingsSection } from "./telegram-section";
+import { WhatsAppSettingsSection } from "./whatsapp-section";
 
-function PlaceholderChannelCard({ channel, label, phase }: { channel: "ANDROID_SMS" | "WHATSAPP"; label: string; phase: string }) {
+function PlaceholderChannelCard({ channel, label, phase }: { channel: "ANDROID_SMS"; label: string; phase: string }) {
   return (
     <section className="flex flex-col gap-2 rounded-lg border border-dashed border-border bg-surface p-4">
       <div className="flex items-center justify-between">
@@ -29,13 +33,9 @@ export function ChannelIntegrationsList() {
       <PlaceholderChannelCard
         channel="ANDROID_SMS"
         label="Android SMS gateway"
-        phase="Device registration, heartbeat, and message polling ship in Phase 8."
+        phase="Device registration, heartbeat, and message polling shipped in Phase 8 (server-side). No Settings UI section is wired up here yet — a documented follow-up, see docs/channel-adapters.md."
       />
-      <PlaceholderChannelCard
-        channel="WHATSAPP"
-        label="WhatsApp Business"
-        phase="Graph API integration and webhook verification ship in Phase 9 (behind the WHATSAPP_ENABLED flag)."
-      />
+      <WhatsAppSettingsSection />
     </div>
   );
 }
