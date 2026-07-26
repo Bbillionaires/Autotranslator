@@ -1,0 +1,364 @@
+// prisma/schema.prisma
+//
+// This schema is copied verbatim from docs/implementation-plan.md §4 ("Prisma Schema").
+// Do not redesign these models without updating the plan first — see the plan for the
+// rationale behind every design decision here (org-scoping, cascade choices, soft-delete
+// fields, idempotency key, etc).
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------- Enums ----------
+
+enum Role {
+  OWNER
+  ADMINISTRATOR
+  MANAGER
+  AGENT
+  VIEWER
+}
+
+enum TeamRole {
+  LEAD
+  MEMBER
+}
+
+enum ChannelType {
+  TELEGRAM
+  ANDROID_SMS
+  WHATSAPP
+  MESSENGER
+  INSTAGRAM
+  EMAIL
+}
+
+enum ChannelAccountStatus {
+  PENDING_SETUP
+  ACTIVE
+  DISABLED
+  ERROR
+}
+
+enum ConversationStatus {
+  OPEN
+  PENDING
+  RESOLVED
+  ARCHIVED
+}
+
+enum SenderType {
+  CONTACT
+  USER
+  SYSTEM
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageStatus {
+  QUEUED
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  DEAD_LETTER
+}
+
+// ---------- Core tenancy ----------
+
+model Organization {
+  id              String   @id @default(cuid())
+  name            String
+  defaultLanguage String   @default("en")
+  timezone        String   @default("UTC")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  users                 User[]
+  teams                 Team[]
+  contacts              Contact[]
+  channelAccounts       ChannelAccount[]
+  conversations         Conversation[]
+  messages              Message[]
+  translationGlossaries TranslationGlossary[]
+  auditLogs             AuditLog[]
+
+  @@index([name])
+}
+
+model User {
+  id                String    @id @default(cuid())
+  organizationId    String
+  name              String
+  email             String
+  preferredLanguage String    @default("en")
+  role              Role      @default(AGENT)
+  // Auth.js (Credentials + Email provider) support fields:
+  passwordHash      String?
+  image             String?
+  emailVerified     DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  organization          Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  teamMemberships       TeamMember[]
+  assignedConversations Conversation[] @relation("ConversationAssignedUser")
+  auditLogs             AuditLog[]
+  sessions              Session[]
+  accounts              Account[]
+
+  @@unique([organizationId, email])
+  @@index([organizationId])
+}
+
+// Auth.js Prisma adapter models
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------- Teams ----------
+
+model Team {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  members       TeamMember[]
+  conversations Conversation[] @relation("ConversationAssignedTeam")
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+model TeamMember {
+  teamId    String
+  userId    String
+  role      TeamRole @default(MEMBER)
+  createdAt DateTime @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([teamId, userId])
+  @@index([userId])
+}
+
+// ---------- Contacts & channels ----------
+
+model Contact {
+  id                String    @id @default(cuid())
+  organizationId    String
+  displayName       String
+  preferredLanguage String?
+  detectedLanguage  String?
+  phoneNumber       String?
+  email             String?
+  notes             String?
+  archivedAt        DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  organization  Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  identities    ContactChannelIdentity[]
+  conversations Conversation[]
+
+  @@unique([organizationId, phoneNumber])
+  @@index([organizationId])
+  @@index([organizationId, displayName])
+}
+
+model ChannelAccount {
+  id                   String               @id @default(cuid())
+  organizationId       String
+  channelType          ChannelType
+  displayName          String
+  externalAccountId    String?
+  // Reference to a secret in the encryption/secrets layer — never the raw credential.
+  // See security section (6.6) for the production encryption plan.
+  credentialRef        String?
+  status               ChannelAccountStatus @default(PENDING_SETUP)
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+
+  organization  Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  identities    ContactChannelIdentity[]
+  conversations Conversation[]
+
+  @@unique([organizationId, channelType, externalAccountId])
+  @@index([organizationId])
+}
+
+model ContactChannelIdentity {
+  id                String   @id @default(cuid())
+  contactId         String
+  channelAccountId  String
+  externalContactId String
+  externalUsername  String?
+  phoneNumber       String?
+  metadata          Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  contact        Contact        @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  channelAccount ChannelAccount @relation(fields: [channelAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([channelAccountId, externalContactId])
+  @@index([contactId])
+}
+
+// ---------- Conversations & messages ----------
+
+model Conversation {
+  id                        String             @id @default(cuid())
+  organizationId            String
+  contactId                 String
+  channelAccountId          String
+  assignedUserId            String?
+  assignedTeamId            String?
+  preferredLanguageOverride String?
+  status                    ConversationStatus @default(OPEN)
+  lastMessageAt             DateTime?
+  createdAt                 DateTime           @default(now())
+  updatedAt                 DateTime           @updatedAt
+
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  contact        Contact        @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  channelAccount ChannelAccount @relation(fields: [channelAccountId], references: [id], onDelete: Cascade)
+  assignedUser   User?          @relation("ConversationAssignedUser", fields: [assignedUserId], references: [id], onDelete: SetNull)
+  assignedTeam   Team?          @relation("ConversationAssignedTeam", fields: [assignedTeamId], references: [id], onDelete: SetNull)
+  messages       Message[]
+
+  @@unique([contactId, channelAccountId])
+  @@index([organizationId, status, lastMessageAt])
+  @@index([assignedUserId])
+  @@index([assignedTeamId])
+}
+
+model Message {
+  id                    String           @id @default(cuid())
+  organizationId        String
+  conversationId        String
+  senderType            SenderType
+  direction             MessageDirection
+  originalText          String
+  translatedText        String?
+  sourceLanguage        String?
+  targetLanguage        String?
+  translationProvider   String?
+  translationConfidence Float?
+  translationEdited     Boolean          @default(false)
+  channelType           ChannelType
+  externalMessageId     String?
+  externalReplyToId     String?
+  status                MessageStatus    @default(QUEUED)
+  failureReason         String?
+  idempotencyKey        String
+  isInternalNote        Boolean          @default(false)
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+
+  organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversation Conversation   @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  events       MessageEvent[]
+
+  @@unique([organizationId, idempotencyKey])
+  @@index([conversationId, createdAt])
+  @@index([organizationId, status])
+  @@index([externalMessageId])
+}
+
+model MessageEvent {
+  id              String   @id @default(cuid())
+  messageId       String
+  eventType       String // e.g. "received" | "sent" | "delivered" | "read" | "failed" | "retry_scheduled" | "duplicate_webhook_ignored"
+  externalEventId String?
+  payload         Json?
+  createdAt       DateTime @default(now())
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, eventType, externalEventId])
+  @@index([messageId, createdAt])
+}
+
+// ---------- Glossaries & audit ----------
+
+model TranslationGlossary {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  sourceLanguage String
+  targetLanguage String
+  terms          Json // [{ term: string; translation: string; notes?: string }]
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, name])
+  @@index([organizationId, sourceLanguage, targetLanguage])
+}
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String?
+  action         String
+  entityType     String
+  entityId       String
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([entityType, entityId])
+}
