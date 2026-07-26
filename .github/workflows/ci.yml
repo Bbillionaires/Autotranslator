@@ -27,3 +27,6 @@ jobs:
 
       - name: Validate Prisma schema
         run: npx prisma validate
+
+      - name: Unit tests
+        run: npm test
