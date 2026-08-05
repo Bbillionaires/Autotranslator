@@ -4,6 +4,7 @@ import { roleAtLeast } from "@/server/roles";
 import { ChannelIntegrationsList } from "./channel-integrations";
 import { GlossarySection } from "./glossary-section";
 import { OrgSettingsForm } from "./org-settings-form";
+import { UsersSection } from "./users-section";
 
 export default async function SettingsPage() {
   const session = await auth();
@@ -16,6 +17,8 @@ export default async function SettingsPage() {
       <h1 className="text-2xl font-semibold text-foreground">Settings</h1>
 
       <OrgSettingsForm />
+
+      <UsersSection />
 
       <div className="flex flex-col gap-2">
         <h2 className="text-lg font-semibold text-foreground">Channel integrations</h2>

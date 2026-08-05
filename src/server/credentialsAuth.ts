@@ -79,6 +79,13 @@ export async function verifyCredentials(
   if (!user.passwordHash) {
     return null;
   }
+  if (user.deactivatedAt) {
+    // H3: a deactivated user cannot sign in via Credentials. Note: this only blocks NEW
+    // sign-ins — it does not invalidate an already-issued JWT session (this app's JWT
+    // strategy doesn't re-check the DB per request); see deactivateUser's doc comment for
+    // this documented limitation.
+    return null;
+  }
 
   const passwordMatches = await bcrypt.compare(password, user.passwordHash);
   if (!passwordMatches) {

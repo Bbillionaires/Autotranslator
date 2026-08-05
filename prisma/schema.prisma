@@ -113,6 +113,15 @@ model User {
   passwordHash      String?
   image             String?
   emailVerified     DateTime?
+  // H3 fix (docs/review-report.md): user-management additive field. Soft-deactivation via a
+  // nullable timestamp, matching the existing `Contact.archivedAt`/`ChannelAccount.revokedAt`
+  // convention rather than inventing a new boolean-flag pattern. `deactivateUser` sets this;
+  // a deactivated user still exists (audit history, past messages/assignments stay intact)
+  // but cannot sign in (`verifyCredentials` rejects any user with `deactivatedAt` set) and is
+  // excluded from `listUsers`' default "active" view. Default null is a safe, backward-
+  // compatible default for every pre-existing row (no existing user is retroactively
+  // deactivated by this migration).
+  deactivatedAt     DateTime?
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 

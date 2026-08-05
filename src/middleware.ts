@@ -38,7 +38,7 @@ const CSP_DIRECTIVES = [
   "form-action 'self'",
 ].join("; ");
 
-export function middleware(request: NextRequest): NextResponse {
+export function middleware(_request: NextRequest): NextResponse {
   const response = NextResponse.next();
 
   response.headers.set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");

@@ -75,4 +75,26 @@ export const userRepository = {
     }
     return userRepository.findByIdInOrgOrThrow(organizationId, userId);
   },
+
+  /**
+   * H3 fix (docs/review-report.md): soft-deactivates a user by setting `deactivatedAt`,
+   * matching the `Contact.archivedAt`/`ChannelAccount.revokedAt` convention. Blocks future
+   * sign-in (`verifyCredentials` checks this), but does not delete the row or touch past
+   * `AuditLog`/`Conversation.assignedUserId`/`Message` history.
+   */
+  async deactivate(organizationId: string, userId: string) {
+    const result = await prisma.user.updateMany({
+      where: { id: userId, organizationId },
+      data: { deactivatedAt: new Date() },
+    });
+    if (result.count === 0) {
+      throw new NotFoundError("User not found.", { organizationId, userId });
+    }
+    return userRepository.findByIdInOrgOrThrow(organizationId, userId);
+  },
+
+  /** Count of non-deactivated OWNER-role users in an org — the "last Owner" guard's building block (see actions/users.ts). */
+  async countActiveOwners(organizationId: string): Promise<number> {
+    return prisma.user.count({ where: { organizationId, role: "OWNER", deactivatedAt: null } });
+  },
 };
