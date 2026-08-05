@@ -4,6 +4,7 @@
  * standing in for a real channel — no network call is ever made.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import type { DetectLanguageResult, TranslateInput, TranslateResult, TranslationProvider } from "../translation/types";
 import { configureTestDatabaseEnv } from "./__tests__/testDb";
 
 configureTestDatabaseEnv();
@@ -18,6 +19,19 @@ const { messageEventRepository } = await import("../repositories/messageEventRep
 const { FakeChannelAdapter } = await import("../channels/__tests__/fakeAdapter");
 const { sendMessage, confirmAndSend, retryMessage, addInternalNote } = await import("./outboundService");
 const { DEFAULT_RETRY_POLICY } = await import("./retryQueue");
+const { TranslationEngine } = await import("../translation/engine");
+const { ConflictError } = await import("../errors");
+
+/** Always throws — simulates a translation-provider outage, same pattern as specialCasesAndFailures.test.ts. */
+class FailingProvider implements TranslationProvider {
+  readonly name = "openai" as const;
+  async detectLanguage(_text: string): Promise<DetectLanguageResult> {
+    throw new Error("Simulated OpenAI timeout during detectLanguage");
+  }
+  async translate(_input: TranslateInput): Promise<TranslateResult> {
+    throw new Error("Simulated OpenAI timeout during translate");
+  }
+}
 
 let organizationId: string;
 
@@ -184,6 +198,56 @@ describe("retry/backoff reaching DEAD_LETTER", () => {
     // Manual retry is still allowed on a FAILED message.
     const retried = await retryMessage(organizationId, result.message.id, { adapter });
     expect(retried.outcome).toBe("SENT");
+  });
+});
+
+describe("confirmAndSend precondition guard (NEW-1 fix, docs/review-report.md 'Final Review')", () => {
+  it("throws BEFORE calling the adapter when the message is FAILED at the translation step (never leaks raw originalText to the real contact)", async () => {
+    const { conversation } = await setUpConversation();
+    const adapter = new FakeChannelAdapter("TELEGRAM");
+    const failingEngine = new TranslationEngine(new FailingProvider());
+
+    const failed = await sendMessage(
+      { organizationId, conversationId: conversation.id, text: "SECRET RAW ENGLISH TEXT" },
+      { adapter, engine: failingEngine },
+    );
+    expect(failed.outcome).toBe("FAILED");
+    expect(failed.message.status).toBe("FAILED");
+    expect(failed.message.translatedText).toBeNull();
+    expect(adapter.sentMessages).toHaveLength(0);
+
+    // Calling confirmAndSend directly (e.g. a stale "Confirm & send" click, or a network
+    // retry of that same click) on this translation-FAILED message must throw BEFORE ever
+    // touching the adapter — not send the raw, untranslated text and fail only afterward.
+    await expect(confirmAndSend(organizationId, failed.message.id, { adapter })).rejects.toThrow(ConflictError);
+    await expect(confirmAndSend(organizationId, failed.message.id, { adapter })).rejects.toThrow(
+      "Message is not in a sendable state.",
+    );
+
+    // The adapter must never have been called — the raw English text was never "sent".
+    expect(adapter.sentMessages).toHaveLength(0);
+  });
+
+  it("throws on a second confirmAndSend call for an already-SENT message instead of double-sending", async () => {
+    const { conversation } = await setUpConversation();
+    const adapter = new FakeChannelAdapter("TELEGRAM");
+
+    const draft = await sendMessage(
+      { organizationId, conversationId: conversation.id, text: "Confirm me once", reviewBeforeSend: true },
+      { adapter },
+    );
+    expect(draft.outcome).toBe("DRAFT");
+
+    const confirmed = await confirmAndSend(organizationId, draft.message.id, { adapter });
+    expect(confirmed.outcome).toBe("SENT");
+    expect(adapter.sentMessages).toHaveLength(1);
+
+    // A second confirmAndSend on the same, now-SENT message (double-click / request retry)
+    // must throw instead of silently re-invoking the adapter a second time.
+    await expect(confirmAndSend(organizationId, draft.message.id, { adapter })).rejects.toThrow(ConflictError);
+
+    // Exactly one adapter call total — no double-send.
+    expect(adapter.sentMessages).toHaveLength(1);
   });
 });
 

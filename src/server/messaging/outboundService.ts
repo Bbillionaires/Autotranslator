@@ -31,6 +31,7 @@ import { channelAccountRepository } from "../repositories/channelAccountReposito
 import { contactChannelIdentityRepository } from "../repositories/contactChannelIdentityRepository";
 import { contactRepository } from "../repositories/contactRepository";
 import { conversationRepository } from "../repositories/conversationRepository";
+import { ConflictError } from "../errors";
 import { messageEventRepository } from "../repositories/messageEventRepository";
 import { messageRepository } from "../repositories/messageRepository";
 import { organizationRepository } from "../repositories/organizationRepository";
@@ -175,6 +176,27 @@ export async function confirmAndSend(
   deps: OutboundServiceDeps,
 ): Promise<SendMessageResult> {
   const message = await messageRepository.findByIdInOrgOrThrow(organizationId, messageId);
+
+  // NEW-1 fix (docs/review-report.md "Final Review"): assert the message is actually in a
+  // sendable state BEFORE ever touching `deps.adapter` — previously the adapter was called
+  // first and this precondition was only checked afterward (via `assertValidTransition`
+  // once the adapter had already returned), which meant a translation-FAILED message's raw
+  // `originalText` could be sent to the real contact, and calling this function twice on an
+  // already-SENT message double-sent silently (`assertValidTransition` treats `from === to`
+  // as a no-op, not an error). `status === "PENDING"` is the only state from which a send
+  // should ever be attempted — mirrors the precondition discipline `retryMessage` already
+  // applies (`assertValidTransition(message.status, "PENDING")`) before doing anything
+  // externally visible, and additionally guards `direction`/`isInternalNote`, neither of
+  // which `retryMessage` needs to check since it's never called on those message shapes.
+  if (message.direction !== "OUTBOUND" || message.isInternalNote || message.status !== "PENDING") {
+    throw new ConflictError("Message is not in a sendable state.", {
+      messageId,
+      direction: message.direction,
+      isInternalNote: message.isInternalNote,
+      status: message.status,
+    });
+  }
+
   const conversation = await conversationRepository.findByIdInOrgOrThrow(organizationId, message.conversationId);
   const channelAccount = await channelAccountRepository.findByIdInOrgOrThrow(organizationId, conversation.channelAccountId);
   const identity = await contactChannelIdentityRepository.findByContactAndChannelAccount(
