@@ -16,18 +16,21 @@
  * two more if existing coverage is thin."
  *
  * Section 2 is the "Translation API failures... confirm the message pipeline degrades
- * gracefully" requirement. IMPORTANT: this uncovered a real, previously-unflagged bug —
- * see docs/test-report.md's bug-findings section. Both `processInboundMessage` and
- * `sendMessage` call `TranslationEngine.translate()`/`.detectLanguage()` with NO try/catch
- * anywhere in the call chain, so a thrown/timed-out translation call propagates as an
- * unhandled rejection and — critically — NO Message row is ever persisted (unlike an
- * adapter/send failure, which IS caught and stored as a FAILED message with
- * `failureReason` populated, per `outboundService.handleSendFailure`). The tests below use
- * `it.fails(...)` (Vitest's "expected to fail" marker) so this real gap is captured as a
- * concrete, reproducible regression test WITHOUT making the overall suite red — if a future
- * fix makes these tests start passing, Vitest will flag that as an unexpected pass,
- * prompting removal of the `.fails` marker. Per the Tester's working rules, the underlying
- * source is intentionally NOT modified here — see docs/test-report.md for the bug report.
+ * gracefully" requirement, and is the regression suite for T1 (docs/test-report.md):
+ * BEFORE the Builder's fix, neither `processInboundMessage` nor `sendMessage` caught a
+ * thrown/timed-out `TranslationEngine.translate()`/`.detectLanguage()` call anywhere in the
+ * call chain, so the exception propagated as an unhandled rejection and — critically — NO
+ * Message row was ever persisted (unlike an adapter/send failure, which IS caught and
+ * stored as a FAILED message with `failureReason` populated, per
+ * `outboundService.handleSendFailure`). The two `it.fails(...)` cases that originally
+ * documented this gap have now been turned into normal, passing tests asserting the FIXED
+ * behavior: both lifecycles catch the failure, persist the already-known `originalText` on
+ * a `FAILED` row with a `failureReason`, and never lose the message. A third pair of tests
+ * below additionally proves the resulting `FAILED` row can be retried successfully once the
+ * translation provider "recovers" — via `outboundService.retryMessage` for the outbound
+ * lifecycle, and `inboundService.retryInboundTranslation` for the inbound lifecycle (see
+ * that function's doc comment for why inbound translation retries are manual, not picked up
+ * by the automatic retry worker).
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { NormalizedInboundMessage } from "../../channels/types";
@@ -44,8 +47,8 @@ const { contactChannelIdentityRepository } = await import("../../repositories/co
 const { conversationRepository } = await import("../../repositories/conversationRepository");
 const { channelAdapterRegistry } = await import("../../channels");
 const { FakeChannelAdapter } = await import("../../channels/__tests__/fakeAdapter");
-const { processInboundMessage } = await import("../../messaging/inboundService");
-const { sendMessage } = await import("../../messaging/outboundService");
+const { processInboundMessage, retryInboundTranslation } = await import("../../messaging/inboundService");
+const { sendMessage, retryMessage } = await import("../../messaging/outboundService");
 const { TranslationEngine } = await import("../engine");
 
 let organizationId: string;
@@ -172,7 +175,7 @@ describe("Special translation content categories survive the real inbound pipeli
   });
 });
 
-describe("Translation API failures — pipeline degradation (KNOWN GAP, see docs/test-report.md)", () => {
+describe("Translation API failures — pipeline degradation (T1 fix regression tests, see docs/test-report.md)", () => {
   class FailingProvider implements TranslationProvider {
     readonly name = "openai" as const;
     async detectLanguage(_text: string): Promise<DetectLanguageResult> {
@@ -183,37 +186,72 @@ describe("Translation API failures — pipeline degradation (KNOWN GAP, see docs
     }
   }
 
-  // EXPECTED TO FAIL: per the module doc comment above, neither processInboundMessage nor
-  // sendMessage catches a thrown translation-provider error, so this assertion (that the
-  // message pipeline "degrades gracefully" and preserves the original text in some durable,
-  // failed-but-visible state) currently does not hold — the exception propagates and NO
-  // Message row is created at all. This it.fails call passes (in the "this is expected to
-  // fail" sense) as long as the bug is present, and will loudly start failing the suite
-  // (an "unexpected pass") the moment a Builder fix makes it actually degrade gracefully.
-  it.fails(
-    "inbound: a translation-provider failure should not silently lose the message (currently it does — no Message row is created at all)",
+  /** A provider that fails its first N calls to each method, then succeeds — simulates a translation-provider outage that later recovers. */
+  class RecoveringProvider implements TranslationProvider {
+    readonly name = "openai" as const;
+    private detectCalls = 0;
+    private translateCalls = 0;
+    constructor(
+      private readonly failDetectTimes = 0,
+      private readonly failTranslateTimes = 0,
+    ) {}
+    async detectLanguage(_text: string): Promise<DetectLanguageResult> {
+      this.detectCalls += 1;
+      if (this.detectCalls <= this.failDetectTimes) {
+        throw new Error("Simulated OpenAI timeout during detectLanguage");
+      }
+      return { language: "es", confidence: 0.9 };
+    }
+    async translate(input: TranslateInput): Promise<TranslateResult> {
+      this.translateCalls += 1;
+      if (this.translateCalls <= this.failTranslateTimes) {
+        throw new Error("Simulated OpenAI timeout during translate");
+      }
+      return {
+        translatedText: `[translated] ${input.text}`,
+        sourceLanguage: input.sourceLanguage ?? "es",
+        targetLanguage: input.targetLanguage,
+        confidence: 0.9,
+        provider: "openai",
+      };
+    }
+  }
+
+  it(
+    "inbound: a translation-provider failure does not silently lose the message — it's stored as FAILED with a failureReason",
     async () => {
       const { channelAccount } = await setUpOrgAndChannel();
       const engine = new TranslationEngine(new FailingProvider());
 
-      await processInboundMessage(
+      const result = await processInboundMessage(
         buildNormalized("failing-provider-contact", "This message should survive a translation outage", "ext-fail-1"),
         channelAccount,
         { engine },
       );
 
-      // What SHOULD be true (per the product brief): the original text is preserved
-      // somewhere durable, in a clear failure state — not silently discarded.
+      expect(result.wasDuplicate).toBe(false);
+      expect(result.message.originalText).toBe("This message should survive a translation outage");
+      expect(result.message.translatedText).toBeNull();
+      expect(result.message.status).toBe("FAILED");
+      expect(result.message.failureReason).toContain("Translation failed");
+
+      // The original text is preserved durably, in a clear failure state — not discarded.
       const stored = await prisma.message.findFirst({
         where: { organizationId, originalText: "This message should survive a translation outage" },
       });
       expect(stored).not.toBeNull();
-      expect(stored?.status).not.toBe("QUEUED"); // some explicit non-crash-y terminal/failed state
+      expect(stored?.status).not.toBe("QUEUED");
+      expect(stored?.status).toBe("FAILED");
+
+      const failedEvent = await prisma.messageEvent.findFirst({
+        where: { messageId: result.message.id, eventType: "translation_failed" },
+      });
+      expect(failedEvent).not.toBeNull();
     },
   );
 
-  it.fails(
-    "outbound: a translation-provider failure while composing a reply should not silently lose the drafted message (currently it does — no Message row is created at all)",
+  it(
+    "outbound: a translation-provider failure while composing a reply does not silently lose the drafted message — it's stored as FAILED with a failureReason, and nothing is sent",
     async () => {
       const { channelAccount } = await setUpOrgAndChannel();
       const contact = await contactRepository.create(organizationId, { displayName: "Failing Provider Outbound Contact" });
@@ -225,16 +263,76 @@ describe("Translation API failures — pipeline degradation (KNOWN GAP, see docs
       const conversation = await conversationRepository.upsertForContactAndChannel(organizationId, contact.id, channelAccount.id);
       const engine = new TranslationEngine(new FailingProvider());
 
-      await sendMessage(
+      const result = await sendMessage(
         { organizationId, conversationId: conversation.id, text: "This compose attempt should survive a translation outage" },
         { adapter, engine },
       );
+
+      expect(result.outcome).toBe("FAILED");
+      expect(result.message.originalText).toBe("This compose attempt should survive a translation outage");
+      expect(result.message.translatedText).toBeNull();
+      expect(result.message.status).toBe("FAILED");
+      expect(result.message.failureReason).toContain("Translation failed");
+      expect(adapter.sentMessages).toHaveLength(0); // must not have sent an untranslated/garbage message either
 
       const stored = await prisma.message.findFirst({
         where: { organizationId, originalText: "This compose attempt should survive a translation outage" },
       });
       expect(stored).not.toBeNull();
-      expect(adapter.sentMessages).toHaveLength(0); // must not have sent an untranslated/garbage message either
+      expect(stored?.status).toBe("FAILED");
     },
   );
+
+  it("outbound: a message that failed at the translation step can be retried successfully once the provider recovers", async () => {
+    const { channelAccount } = await setUpOrgAndChannel();
+    const contact = await contactRepository.create(organizationId, { displayName: "Recovering Provider Outbound Contact" });
+    await contactChannelIdentityRepository.create(organizationId, {
+      contactId: contact.id,
+      channelAccountId: channelAccount.id,
+      externalContactId: "recovering-provider-outbound-contact",
+    });
+    const conversation = await conversationRepository.upsertForContactAndChannel(organizationId, contact.id, channelAccount.id);
+
+    const failingEngine = new TranslationEngine(new RecoveringProvider(0, 1));
+    const failed = await sendMessage(
+      { organizationId, conversationId: conversation.id, text: "Retry me after the outage" },
+      { adapter, engine: failingEngine },
+    );
+    expect(failed.outcome).toBe("FAILED");
+    expect(failed.message.translatedText).toBeNull();
+    expect(adapter.sentMessages).toHaveLength(0);
+
+    // "the provider recovers" — a fresh, already-healthy provider instance.
+    const recoveredEngine = new TranslationEngine(new RecoveringProvider(0, 0));
+    const retried = await retryMessage(organizationId, failed.message.id, { adapter, engine: recoveredEngine });
+
+    expect(retried.outcome).toBe("SENT");
+    expect(retried.message.status).toBe("SENT");
+    expect(retried.message.translatedText).toBe("[translated] Retry me after the outage");
+    expect(retried.message.failureReason).toBeNull();
+    expect(adapter.sentMessages).toHaveLength(1);
+    expect(adapter.sentMessages[0].text).toBe("[translated] Retry me after the outage");
+  });
+
+  it("inbound: a message that failed at the translation step can be retried successfully once the provider recovers", async () => {
+    const { channelAccount } = await setUpOrgAndChannel();
+
+    const failingEngine = new TranslationEngine(new RecoveringProvider(1, 1));
+    const failed = await processInboundMessage(
+      buildNormalized("recovering-provider-inbound-contact", "Please retry my translation", "ext-recover-1"),
+      channelAccount,
+      { engine: failingEngine },
+    );
+    expect(failed.message.status).toBe("FAILED");
+    expect(failed.message.translatedText).toBeNull();
+
+    // "the provider recovers" — a fresh, already-healthy provider instance.
+    const recoveredEngine = new TranslationEngine(new RecoveringProvider(0, 0));
+    const retried = await retryInboundTranslation(organizationId, failed.message.id, { engine: recoveredEngine });
+
+    expect(retried.status).toBe("DELIVERED");
+    expect(retried.translatedText).toBe("[translated] Please retry my translation");
+    expect(retried.sourceLanguage).toBe("es");
+    expect(retried.failureReason).toBeNull();
+  });
 });
