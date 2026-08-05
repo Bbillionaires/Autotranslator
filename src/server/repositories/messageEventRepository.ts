@@ -23,6 +23,11 @@ export type MessageEventType =
   | "duplicate_webhook_ignored"
   | "internal_note_added"
   | "translation_edited"
+  // T1 fix (docs/test-report.md): a `TranslationEngine.detectLanguage()`/`.translate()`
+  // call threw, on either the inbound or outbound lifecycle. Distinct from "failed" (which
+  // is reserved for adapter/send failures) so a message's event history makes clear which
+  // step actually failed.
+  | "translation_failed"
   // Phase 8 (Android SMS gateway): the adapter accepted the message for device pickup
   // (`AndroidSmsAdapter.sendMessage` returning `status: "QUEUED"`) — distinct from "sent"
   // since the channel hasn't actually transmitted it yet, only queued it.

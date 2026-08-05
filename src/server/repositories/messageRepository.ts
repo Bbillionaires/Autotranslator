@@ -93,6 +93,41 @@ export const messageRepository = {
     return messageRepository.findByIdInOrgOrThrow(organizationId, id, client);
   },
 
+  /**
+   * T1 fix (docs/test-report.md): completes a `Message` row's translation fields after it
+   * was already stored (as `PENDING`, `originalText`-only) *before* the translation call
+   * was attempted — the "store first" discipline now shared by both the inbound and
+   * outbound lifecycles. Called once `TranslationEngine.detectLanguage()`/`.translate()`
+   * actually succeeds, whether on the first attempt or a later manual retry. `status` is
+   * caller-supplied (not defaulted here) since the two callers need different targets:
+   * `inboundService.ts` moves `PENDING -> DELIVERED`; `outboundService.ts` leaves the
+   * message `PENDING` (still awaiting either the review-before-send gate or an immediate
+   * send attempt) — the transition itself is validated by the caller via
+   * `assertValidTransition` before this is called, same discipline as `updateStatus`.
+   */
+  async updateTranslationResult(
+    organizationId: string,
+    id: string,
+    data: {
+      status: MessageStatus;
+      translatedText: string;
+      sourceLanguage: string;
+      targetLanguage: string;
+      translationProvider: string;
+      translationConfidence: number;
+    },
+    client: PrismaClientOrTx = prisma,
+  ) {
+    const result = await client.message.updateMany({
+      where: { id, organizationId },
+      data,
+    });
+    if (result.count === 0) {
+      throw new NotFoundError("Message not found.", { organizationId, id });
+    }
+    return messageRepository.findByIdInOrgOrThrow(organizationId, id, client);
+  },
+
   async markTranslationEdited(
     organizationId: string,
     id: string,
@@ -123,12 +158,21 @@ export const messageRepository = {
     });
   },
 
+  /**
+   * T1 fix (docs/test-report.md): scoped to `direction: "OUTBOUND"` — a `FAILED` INBOUND
+   * message (a translation failure on receipt; see `inboundService.ts`) is deliberately
+   * NOT eligible for this automatic worker, since `outboundService.retryMessage`'s retry
+   * path assumes a send-oriented retry (resolve the conversation's adapter, call
+   * `confirmAndSend`), which doesn't apply to a message with no send step at all. Inbound
+   * translation-failure retries are manual only — see `inboundService.retryInboundTranslation`
+   * and its doc comment for the full rationale.
+   */
   async listFailedAwaitingRetry(
     organizationId: string,
     client: PrismaClientOrTx = prisma,
   ): Promise<Array<Prisma.MessageGetPayload<{ include: { events: true } }>>> {
     return client.message.findMany({
-      where: { organizationId, status: "FAILED", isInternalNote: false },
+      where: { organizationId, status: "FAILED", direction: "OUTBOUND", isInternalNote: false },
       include: { events: { where: { eventType: "retry_scheduled" }, orderBy: { createdAt: "desc" } } },
     });
   },
@@ -147,12 +191,16 @@ export const messageRepository = {
    * `outboundService.retryMessage(organizationId, messageId, ...)` — this method itself
    * never bypasses org-scoping for the actual retry/send call, only for the initial
    * "what's due" query.
+   *
+   * T1 fix (docs/test-report.md): also scoped to `direction: "OUTBOUND"` — see
+   * `listFailedAwaitingRetry`'s doc comment above for why a `FAILED` INBOUND (translation
+   * failure) message must never reach this automatic, send-oriented retry worker.
    */
   async listAllFailedAwaitingRetryAcrossOrgs(
     client: PrismaClientOrTx = prisma,
   ): Promise<Array<Prisma.MessageGetPayload<{ include: { events: true } }>>> {
     return client.message.findMany({
-      where: { status: "FAILED", isInternalNote: false },
+      where: { status: "FAILED", direction: "OUTBOUND", isInternalNote: false },
       include: { events: { where: { eventType: "retry_scheduled" }, orderBy: { createdAt: "desc" } } },
     });
   },

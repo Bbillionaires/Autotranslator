@@ -92,10 +92,20 @@ export function nextRetryDecision(
  * message can fail before ever being picked up by a device, e.g. a revoked device); the
  * device's `POST /api/gateways/messages/:id/fail` reuses that same transition via
  * `outboundService.handleSendFailure`.
+ *
+ * `PENDING -> DELIVERED` (T1 fix, docs/test-report.md): the inbound lifecycle
+ * (`inboundService.processInboundMessage`) now stores its `Message` row as `PENDING`
+ * *before* attempting `TranslationEngine.detectLanguage()`/`.translate()` (mirroring the
+ * outbound "store first" discipline), so the original text is durable even if translation
+ * fails. On a successful translation the row moves `PENDING -> DELIVERED` (inbound messages
+ * are already delivered to us by definition — there is no separate "sent" step) — a
+ * transition no outbound code path ever performs (outbound only ever reaches `DELIVERED`
+ * via a channel's own delivery-status callback after `SENT`, per `deliveryStatusService.ts`),
+ * so allowing it here does not loosen any outbound invariant in practice.
  */
 const VALID_TRANSITIONS: Record<MessageStatus, readonly MessageStatus[]> = {
   QUEUED: ["PENDING", "SENT", "FAILED"],
-  PENDING: ["SENT", "QUEUED", "FAILED"],
+  PENDING: ["SENT", "QUEUED", "FAILED", "DELIVERED"],
   SENT: ["DELIVERED", "FAILED"],
   DELIVERED: ["READ"],
   READ: [],

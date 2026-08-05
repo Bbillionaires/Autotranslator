@@ -44,3 +44,32 @@ export function classifyAdapterFailure(error: unknown): FailureClassification {
 
   return "transient";
 }
+
+/**
+ * T1 fix (docs/test-report.md): sibling classifier for `TranslationEngine.detectLanguage()`/
+ * `.translate()` failures (OpenAI timeout/5xx/etc.), used by `inboundService.ts` and
+ * `outboundService.ts` wherever a translation-provider call throws.
+ *
+ * Deliberately delegates to `classifyAdapterFailure` above rather than duplicating its
+ * logic: the real `OpenAiTranslationProvider` already throws the same `UpstreamAdapterError`
+ * shape (with an optional `detail.transient`/`detail.status` hint) that adapter-send
+ * failures do, so the exact same transient-vs-permanent-by-status reasoning applies
+ * unchanged. The one thing genuinely specific to translation is "obviously permanent"
+ * provider errors that no amount of retrying will fix on their own — e.g. an unsupported
+ * language code rejected by the provider — which this classifier special-cases to
+ * "permanent" before falling back to `classifyAdapterFailure`'s generic handling.
+ */
+const PERMANENT_TRANSLATION_ERROR_PATTERNS: readonly RegExp[] = [
+  /unsupported language/i,
+  /language not supported/i,
+  /invalid language code/i,
+];
+
+/** Classifies a thrown translation-provider error as "transient" (retry-worthy) or "permanent" (don't auto-retry). */
+export function classifyTranslationFailure(error: unknown): FailureClassification {
+  const message = error instanceof Error ? error.message : String(error);
+  if (PERMANENT_TRANSLATION_ERROR_PATTERNS.some((pattern) => pattern.test(message))) {
+    return "permanent";
+  }
+  return classifyAdapterFailure(error);
+}
