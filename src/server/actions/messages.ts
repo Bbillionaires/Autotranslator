@@ -25,6 +25,7 @@ import type { Message } from "@prisma/client";
 import { auth } from "../auth";
 import { channelAdapterRegistry } from "../channels";
 import { toSafeActionError, ValidationError } from "../errors";
+import { retryInboundTranslation } from "../messaging/inboundService";
 import { confirmAndSend, sendMessage, retryMessage as retryOutboundMessage, type SendMessageResult } from "../messaging/outboundService";
 import { auditLogRepository } from "../repositories/auditLogRepository";
 import { channelAccountRepository } from "../repositories/channelAccountRepository";
@@ -106,6 +107,26 @@ export async function retryConversationMessage(input: { messageId: string }): Pr
 
     const { adapter } = await resolveAdapterForMessage(organizationId, input.messageId);
     const result = await retryOutboundMessage(organizationId, input.messageId, { adapter });
+    return { ok: true, data: result };
+  } catch (error) {
+    return { ok: false, ...toSafeActionError(error) };
+  }
+}
+
+/**
+ * T1 fix (docs/test-report.md): manual retry entrypoint for an INBOUND message that failed
+ * at the translation step — the counterpart of `retryConversationMessage` above, but for
+ * `inboundService.retryInboundTranslation` instead of `outboundService.retryMessage` (see
+ * that function's doc comment for why inbound translation retries are manual, not picked up
+ * by the automatic retry worker). No adapter resolution needed — there is no send step.
+ */
+export async function retryInboundMessageTranslation(input: { messageId: string }): Promise<ActionResult<Message>> {
+  try {
+    const session = await auth();
+    requireRole(session?.user?.role, "AGENT");
+    const organizationId = session!.user.organizationId;
+
+    const result = await retryInboundTranslation(organizationId, input.messageId);
     return { ok: true, data: result };
   } catch (error) {
     return { ok: false, ...toSafeActionError(error) };

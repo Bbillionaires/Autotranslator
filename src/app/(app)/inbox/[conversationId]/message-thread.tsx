@@ -11,7 +11,7 @@
 import { useState, useTransition } from "react";
 import type { Message } from "@prisma/client";
 import { DeliveryStatusBadge } from "@/components/delivery-status-badge";
-import { retryConversationMessage } from "@/server/actions/messages";
+import { retryConversationMessage, retryInboundMessageTranslation } from "@/server/actions/messages";
 
 function TranslationStatusBadge({ message }: { message: Message }) {
   if (message.isInternalNote) {
@@ -51,12 +51,20 @@ function MessageBubble({ message, canRetry }: { message: Message; canRetry: bool
   const isInbound = message.direction === "INBOUND";
   const displayText = showOriginal ? message.originalText : (message.translatedText ?? message.originalText);
   const canShowToggle = Boolean(message.translatedText) && message.translatedText !== message.originalText;
+  // T1 fix (docs/test-report.md): a FAILED/DEAD_LETTER OUTBOUND message retries via
+  // `retryConversationMessage` (adapter resend, possibly re-translating first); a FAILED
+  // INBOUND message (translation failed on receipt — DEAD_LETTER never applies to inbound,
+  // there's no automatic retry/backoff for it) retries via `retryInboundMessageTranslation`
+  // instead — see `handleRetry` below. Routing an inbound message through the outbound retry
+  // action would incorrectly try to "send" it back out through the channel adapter.
   const canRetryThis = canRetry && (message.status === "FAILED" || message.status === "DEAD_LETTER");
 
   function handleRetry() {
     setRetryError(null);
     startTransition(async () => {
-      const result = await retryConversationMessage({ messageId: message.id });
+      const result = isInbound
+        ? await retryInboundMessageTranslation({ messageId: message.id })
+        : await retryConversationMessage({ messageId: message.id });
       if (!result.ok) {
         setRetryError(result.message);
       }
