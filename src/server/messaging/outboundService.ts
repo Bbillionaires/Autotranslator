@@ -183,11 +183,15 @@ export async function confirmAndSend(
   // once the adapter had already returned), which meant a translation-FAILED message's raw
   // `originalText` could be sent to the real contact, and calling this function twice on an
   // already-SENT message double-sent silently (`assertValidTransition` treats `from === to`
-  // as a no-op, not an error). `status === "PENDING"` is the only state from which a send
-  // should ever be attempted — mirrors the precondition discipline `retryMessage` already
-  // applies (`assertValidTransition(message.status, "PENDING")`) before doing anything
-  // externally visible, and additionally guards `direction`/`isInternalNote`, neither of
-  // which `retryMessage` needs to check since it's never called on those message shapes.
+  // as a no-op, not an error). `direction`/`isInternalNote` never change concurrently for a
+  // given row (set once at creation, never mutated afterward), so checking them via this
+  // plain read is safe — they are not part of the NEW-5 race below.
+  //
+  // The `status !== "PENDING"` check here is now only a *fast-path* rejection (skip the
+  // conversation/channelAccount/identity lookups for an obviously-not-sendable message) —
+  // it is NOT what actually enforces the precondition anymore. See the NEW-5 fix below for
+  // why: this same read-then-check shape, on its own, is a classic TOCTOU race under genuine
+  // concurrency.
   if (message.direction !== "OUTBOUND" || message.isInternalNote || message.status !== "PENDING") {
     throw new ConflictError("Message is not in a sendable state.", {
       messageId,
@@ -212,16 +216,60 @@ export async function confirmAndSend(
     });
   }
 
+  // NEW-5 fix (docs/test-report.md "Final Verification" — High: the NEW-1 guard above reads
+  // `message.status` and only *afterward* calls `deps.adapter`, so two genuinely concurrent
+  // `confirmAndSend` calls on the same `PENDING` message (an ordinary double-click firing two
+  // overlapping requests, or a manual retry overlapping the H4 automatic retry-worker cron)
+  // could both read PENDING, both pass that in-memory check, and both call the adapter — a
+  // silent duplicate real send, reproduced independently by the Tester in 2/5 concurrent runs.
+  //
+  // Fixed by making the state transition itself the guard, enforced by Postgres rather than
+  // application memory: `messageRepository.claimForTransition` issues a single conditional
+  // `UPDATE ... WHERE id = $1 AND status = 'PENDING'`, which can affect at most one row for
+  // at most one caller no matter how many callers race it (row-level locking during that one
+  // statement is what makes this atomic — an in-process mutex would NOT close this race,
+  // since this app can run as multiple server instances/serverless invocations). This claim
+  // happens immediately before the adapter call, and *after* every lookup above that can
+  // throw without having mutated anything, so a `NotFoundError`/`NotFoundError`-shaped
+  // failure here never leaves a message wedged mid-claim.
+  //
+  // `PENDING -> SENDING` is a new, additive intermediate `MessageStatus` (see
+  // prisma/schema.prisma) added specifically for this claim. A same-value `PENDING ->
+  // PENDING` "self-claim" was considered and rejected: it does not work as a mutual-exclusion
+  // mechanism, because a concurrent second claim's `WHERE status = 'PENDING'` still matches
+  // after the first claim's identical-value `UPDATE` commits (the stored value never actually
+  // changed) — the row has to move to a status the second caller's predicate excludes. Holding
+  // a `SELECT ... FOR UPDATE` row lock open across the adapter's network call was also
+  // rejected (it would block all other work on the row for the duration of an external I/O
+  // call, including the finalize write below). A short-lived, additive enum value avoids both
+  // problems without requiring a full "reserve/send/finalize" state-machine redesign — every
+  // existing `PENDING -> SENT | QUEUED | FAILED | DELIVERED` transition remains valid,
+  // `SENDING` only ever sits between `PENDING` and its usual next state.
+  //
+  // The loser of the race gets `claimed === null` here and throws the exact same
+  // `ConflictError` as the NEW-1 fast-path check above — before `deps.adapter` is ever
+  // touched. Not a crash, not a silent no-op, and (per the verification test) never a second
+  // adapter call.
+  const claimed = await messageRepository.claimForTransition(organizationId, messageId, "PENDING", "SENDING");
+  if (!claimed) {
+    throw new ConflictError("Message is not in a sendable state.", {
+      messageId,
+      direction: message.direction,
+      isInternalNote: message.isInternalNote,
+      status: message.status,
+    });
+  }
+
   let sendResult;
   try {
     sendResult = await deps.adapter.sendMessage({
       channelAccount,
       externalContactId: identity.externalContactId,
-      text: message.translatedText ?? message.originalText,
-      replyToExternalId: message.externalReplyToId ?? undefined,
+      text: claimed.translatedText ?? claimed.originalText,
+      replyToExternalId: claimed.externalReplyToId ?? undefined,
     });
   } catch (error) {
-    return handleSendFailure(organizationId, message, error);
+    return handleSendFailure(organizationId, claimed, error);
   }
 
   // The message is only ever marked SENT/QUEUED after the adapter call *returns success* —
@@ -234,7 +282,13 @@ export async function confirmAndSend(
   // later, when the device calls `POST /api/gateways/messages/:id/acknowledge`
   // (`acknowledgeMessage` below reuses `assertValidTransition`/`messageEventRepository` the
   // exact same way this function does).
-  assertValidTransition(message.status, sendResult.status);
+  //
+  // `updateStatus` (not another `claimForTransition`) is safe (not re-racy) here: this
+  // caller is the exclusive owner of the row from the moment its claim above succeeded —
+  // every other concurrent caller's own claim attempt on this same `messageId` already
+  // failed (the row stopped being `PENDING` the instant this caller's claim committed), so
+  // nothing else can be concurrently mutating this row's status at this point.
+  assertValidTransition(claimed.status, sendResult.status);
   const updated = await messageRepository.updateStatus(organizationId, messageId, sendResult.status, {
     externalMessageId: sendResult.externalMessageId,
   });
@@ -359,6 +413,20 @@ async function scheduleNextRetry(organizationId: string, messageId: string): Pro
  * i.e. the raw untranslated text, straight to the channel. `translatedText === null` is
  * exactly the signal that distinguishes the two cases, since a successful translation
  * always populates it before the message can ever reach the send step.
+ *
+ * NEW-5 fix (docs/test-report.md "Final Verification"): the same TOCTOU race
+ * `confirmAndSend` closes above applies here too, and is realistic here specifically because
+ * H4's automatic retry-worker cron pass can genuinely overlap a human's manual "Retry" click
+ * on the same stuck message — independently reproduced by the Tester in 1/5 concurrent runs.
+ * Previously this read `message.status`, checked it via `assertValidTransition` purely in
+ * memory, then wrote `PENDING` via `messageRepository.updateStatus` — whose `WHERE` clause
+ * has no status predicate at all — so both concurrent callers could pass the check and both
+ * write `PENDING`, and both would then go on to race `confirmAndSend`'s own guard too. Fixed
+ * the same way: `messageRepository.claimForTransition` issues a single conditional `UPDATE
+ * ... WHERE id = $1 AND status IN ('FAILED', 'DEAD_LETTER')`, which can match for at most one
+ * caller. The loser gets `claimed === null` and throws `ConflictError` immediately — before
+ * ever calling `engine.translate()` or the adapter (and therefore before it could ever reach
+ * `confirmAndSend`'s own claim on this message at all).
  */
 export async function retryMessage(organizationId: string, messageId: string, deps: OutboundServiceDeps): Promise<SendMessageResult> {
   const message = await messageRepository.findByIdInOrgOrThrow(organizationId, messageId);
@@ -369,13 +437,27 @@ export async function retryMessage(organizationId: string, messageId: string, de
     });
   }
 
-  assertValidTransition(message.status, "PENDING");
   // Clear any stale `failureReason` from the previous attempt — a fresh retry attempt
-  // shouldn't leave a misleading failure message on a row that goes on to succeed.
-  const pending = await messageRepository.updateStatus(organizationId, messageId, "PENDING", { failureReason: null });
+  // shouldn't leave a misleading failure message on a row that goes on to succeed. Folded
+  // into the same atomic claim as the FAILED/DEAD_LETTER -> PENDING transition itself (see
+  // the NEW-5 fix note above) rather than a separate write, so there's no window where the
+  // row is claimed but still carries the old failureReason.
+  const claimed = await messageRepository.claimForTransition(
+    organizationId,
+    messageId,
+    ["FAILED", "DEAD_LETTER"],
+    "PENDING",
+    { failureReason: null },
+  );
+  if (!claimed) {
+    throw new ConflictError("Message is not in a sendable state.", {
+      messageId,
+      status: message.status,
+    });
+  }
 
-  if (pending.translatedText === null) {
-    return retryTranslationThenSend(organizationId, pending, deps);
+  if (claimed.translatedText === null) {
+    return retryTranslationThenSend(organizationId, claimed, deps);
   }
 
   return confirmAndSend(organizationId, messageId, deps);

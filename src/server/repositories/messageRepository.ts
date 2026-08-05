@@ -94,6 +94,47 @@ export const messageRepository = {
   },
 
   /**
+   * NEW-5 fix (docs/test-report.md "Final Verification"): the atomic primitive
+   * `outboundService.confirmAndSend` (`PENDING -> SENDING`, immediately before the adapter
+   * call) and `outboundService.retryMessage` (`FAILED`/`DEAD_LETTER` -> `PENDING`) use to
+   * make their precondition guard database-enforced instead of a check-then-act race in
+   * application memory. Unlike `updateStatus` above — whose `WHERE` clause has no status
+   * predicate at all — this issues a single conditional `UPDATE ... WHERE id = $1 AND
+   * organizationId = $2 AND status IN (...)`. Postgres's own row-level locking during that
+   * one statement is what makes it atomic: among any number of genuinely concurrent callers
+   * racing this same `(id, fromStatus)` pair, at most one `updateMany` can ever match and
+   * flip the row — this is enforced by the database, not an in-process lock/mutex (which
+   * would not close the race across multiple server instances/serverless invocations).
+   *
+   * Returns the updated `Message` when this call won the race (`result.count === 1`), or
+   * `null` when it lost (`result.count === 0` — the row's status had already moved to
+   * something outside `fromStatus` by the time this `UPDATE` ran, meaning some other caller
+   * got there first). Callers are expected to treat `null` as "throw `ConflictError`, do not
+   * proceed" — in particular, never call the channel adapter after a `null` result.
+   */
+  async claimForTransition(
+    organizationId: string,
+    id: string,
+    fromStatus: MessageStatus | readonly MessageStatus[],
+    toStatus: MessageStatus,
+    extra: { failureReason?: string | null; externalMessageId?: string | null } = {},
+    client: PrismaClientOrTx = prisma,
+  ) {
+    const result = await client.message.updateMany({
+      where: {
+        id,
+        organizationId,
+        status: Array.isArray(fromStatus) ? { in: fromStatus } : (fromStatus as MessageStatus),
+      },
+      data: { status: toStatus, ...extra },
+    });
+    if (result.count === 0) {
+      return null;
+    }
+    return messageRepository.findByIdInOrgOrThrow(organizationId, id, client);
+  },
+
+  /**
    * T1 fix (docs/test-report.md): completes a `Message` row's translation fields after it
    * was already stored (as `PENDING`, `originalText`-only) *before* the translation call
    * was attempted — the "store first" discipline now shared by both the inbound and

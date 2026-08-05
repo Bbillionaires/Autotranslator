@@ -102,10 +102,22 @@ export function nextRetryDecision(
  * transition no outbound code path ever performs (outbound only ever reaches `DELIVERED`
  * via a channel's own delivery-status callback after `SENT`, per `deliveryStatusService.ts`),
  * so allowing it here does not loosen any outbound invariant in practice.
+ *
+ * `PENDING -> SENDING` / `SENDING -> SENT|QUEUED|FAILED` (NEW-5 fix, docs/test-report.md
+ * "Final Verification"): `SENDING` is a short-lived, additive status that only ever exists
+ * between `outboundService.confirmAndSend`'s atomic claim (`messageRepository
+ * .claimForTransition`, a single conditional `UPDATE ... WHERE status = 'PENDING'`) and the
+ * adapter call's outcome landing. It exists purely to make that claim database-atomic — a
+ * same-value `PENDING -> PENDING` "self-claim" doesn't work as a mutual-exclusion mechanism,
+ * since a concurrent second claim's `WHERE status = 'PENDING'` still matches after the first
+ * claim commits (the value never changed) — so a real, distinct status was needed. No caller
+ * outside `outboundService.confirmAndSend`/`handleSendFailure` should ever set or expect
+ * `SENDING` to persist for any meaningful duration.
  */
 const VALID_TRANSITIONS: Record<MessageStatus, readonly MessageStatus[]> = {
   QUEUED: ["PENDING", "SENT", "FAILED"],
-  PENDING: ["SENT", "QUEUED", "FAILED", "DELIVERED"],
+  PENDING: ["SENDING", "SENT", "QUEUED", "FAILED", "DELIVERED"],
+  SENDING: ["SENT", "QUEUED", "FAILED"],
   SENT: ["DELIVERED", "FAILED"],
   DELIVERED: ["READ"],
   READ: [],

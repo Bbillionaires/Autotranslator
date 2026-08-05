@@ -13,6 +13,7 @@ import { DeliveryStatusBadge } from "./delivery-status-badge";
 const EXPECTED_LABELS: Record<MessageStatus, string> = {
   QUEUED: "Queued",
   PENDING: "Pending",
+  SENDING: "Sending", // NEW-5 fix: short-lived intermediate status, see delivery-status-badge.tsx
   SENT: "Sent",
   DELIVERED: "Delivered",
   READ: "Read",

@@ -11,6 +11,12 @@ import type { MessageStatus } from "@prisma/client";
 const STATUS_CONFIG: Record<MessageStatus, { label: string; glyph: string; className: string }> = {
   QUEUED: { label: "Queued", glyph: "…", className: "bg-muted/10 text-muted" }, // …
   PENDING: { label: "Pending", glyph: "○", className: "bg-muted/10 text-muted" }, // ○
+  // NEW-5 fix (docs/test-report.md "Final Verification"): SENDING is a short-lived,
+  // additive intermediate status (see prisma/schema.prisma and outboundService.confirmAndSend)
+  // that only exists for the brief window between the atomic send-claim and the adapter
+  // call's outcome landing. It should be visually distinct from PENDING/SENT in the rare
+  // case a UI poll catches a row mid-transition, but never needs to look "stuck" or alarming.
+  SENDING: { label: "Sending", glyph: "→", className: "bg-accent/10 text-accent" }, // →
   SENT: { label: "Sent", glyph: "✓", className: "bg-accent/10 text-accent" }, // ✓
   DELIVERED: { label: "Delivered", glyph: "✓✓", className: "bg-success/10 text-success" }, // ✓✓
   READ: { label: "Read", glyph: "✓✓", className: "bg-success/20 text-success" }, // ✓✓ (filled)

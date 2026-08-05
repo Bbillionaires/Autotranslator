@@ -33,6 +33,26 @@ class FailingProvider implements TranslationProvider {
   }
 }
 
+/**
+ * NEW-5 fix verification helper (docs/test-report.md "Final Verification"): a
+ * `FakeChannelAdapter` whose `sendMessage` takes an artificial `delayMs` before resolving.
+ * Used only by the concurrency tests below, to widen the window between two racing calls'
+ * reads/lookups and their eventual adapter call — real Postgres round-trips already yield
+ * the event loop enough to interleave two `Promise.all`-launched calls, but this makes that
+ * interleaving reliable rather than incidental, so the test genuinely exercises overlap
+ * rather than two calls that happen to run back-to-back.
+ */
+class DelayedFakeChannelAdapter extends FakeChannelAdapter {
+  constructor(private readonly delayMs: number, channelType: "TELEGRAM" | "WHATSAPP" | "ANDROID_SMS" = "TELEGRAM") {
+    super(channelType);
+  }
+
+  override async sendMessage(input: Parameters<InstanceType<typeof FakeChannelAdapter>["sendMessage"]>[0]) {
+    await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    return super.sendMessage(input);
+  }
+}
+
 let organizationId: string;
 
 beforeAll(async () => {
@@ -248,6 +268,91 @@ describe("confirmAndSend precondition guard (NEW-1 fix, docs/review-report.md 'F
 
     // Exactly one adapter call total — no double-send.
     expect(adapter.sentMessages).toHaveLength(1);
+  });
+});
+
+describe("NEW-5 fix — confirmAndSend/retryMessage are atomic under genuine concurrency (docs/test-report.md 'Final Verification')", () => {
+  const ITERATIONS = 10;
+
+  it("confirmAndSend: two genuinely concurrent calls on the same PENDING message result in exactly one adapter send and one clean ConflictError, every time across repeated runs", async () => {
+    for (let i = 0; i < ITERATIONS; i += 1) {
+      const { organization, conversation } = await setUpConversation();
+      // An artificial delay before the adapter actually "sends" widens the race window so
+      // both concurrent calls' reads/lookups genuinely interleave before either one's
+      // atomic claim runs — the fix's correctness doesn't depend on this (the claim is a
+      // single DB statement, atomic regardless of timing), but it makes this test actually
+      // exercise the overlap NEW-5 describes rather than two calls that happen to run
+      // back-to-back.
+      const adapter = new DelayedFakeChannelAdapter(15);
+
+      const draft = await sendMessage(
+        { organizationId, conversationId: conversation.id, text: `Concurrent confirm ${i}`, reviewBeforeSend: true },
+        { adapter },
+      );
+      expect(draft.outcome).toBe("DRAFT");
+
+      const results = await Promise.allSettled([
+        confirmAndSend(organizationId, draft.message.id, { adapter }),
+        confirmAndSend(organizationId, draft.message.id, { adapter }),
+      ]);
+
+      // The real, load-bearing assertion: the fake adapter — standing in for the real
+      // channel a real contact would receive a message through — was invoked exactly once
+      // total across both concurrent calls, never twice.
+      expect(adapter.sentMessages).toHaveLength(1);
+
+      const fulfilled = results.filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof confirmAndSend>>> => r.status === "fulfilled");
+      const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+
+      // Exactly one caller wins (and actually gets SENT back) and exactly one caller loses
+      // — cleanly, via ConflictError, not a crash and not a silent no-op.
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect(fulfilled[0].value.outcome).toBe("SENT");
+      expect(rejected[0].reason).toBeInstanceOf(ConflictError);
+      expect((rejected[0].reason as Error).message).toBe("Message is not in a sendable state.");
+
+      // Clean up this iteration's organization immediately — this test creates
+      // `ITERATIONS` of them in a single `it`, so leaving that to the file-level `afterEach`
+      // (which only knows about the *last* `organizationId` it was pointed at) would leak
+      // every earlier iteration's rows into the test database.
+      await prisma.organization.deleteMany({ where: { id: organization.id } });
+    }
+  });
+
+  it("retryMessage: two genuinely concurrent retries on the same FAILED message (simulating the H4 cron worker overlapping a manual 'Retry' click) result in exactly one adapter send and one clean ConflictError, every time across repeated runs", async () => {
+    for (let i = 0; i < ITERATIONS; i += 1) {
+      const { organization, conversation } = await setUpConversation();
+      const failingAdapter = new FakeChannelAdapter("TELEGRAM");
+      failingAdapter.queueFailure("permanent");
+
+      // A FAILED message with a populated translatedText — i.e. it failed at the *send*
+      // step, not the translation step — so retryMessage goes straight to confirmAndSend
+      // (not retryTranslationThenSend) once it wins the claim, matching the Tester's
+      // original repro scenario.
+      const failed = await sendMessage({ organizationId, conversationId: conversation.id, text: `Retry me concurrently ${i}` }, { adapter: failingAdapter });
+      expect(failed.message.status).toBe("FAILED");
+      expect(failed.message.translatedText).not.toBeNull();
+
+      const retryAdapter = new DelayedFakeChannelAdapter(15);
+      const results = await Promise.allSettled([
+        retryMessage(organizationId, failed.message.id, { adapter: retryAdapter }),
+        retryMessage(organizationId, failed.message.id, { adapter: retryAdapter }),
+      ]);
+
+      expect(retryAdapter.sentMessages).toHaveLength(1);
+
+      const fulfilled = results.filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof retryMessage>>> => r.status === "fulfilled");
+      const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect(fulfilled[0].value.outcome).toBe("SENT");
+      expect(rejected[0].reason).toBeInstanceOf(ConflictError);
+      expect((rejected[0].reason as Error).message).toBe("Message is not in a sendable state.");
+
+      await prisma.organization.deleteMany({ where: { id: organization.id } });
+    }
   });
 });
 

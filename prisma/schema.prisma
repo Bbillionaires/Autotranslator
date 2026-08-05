@@ -66,6 +66,16 @@ enum MessageDirection {
 enum MessageStatus {
   QUEUED
   PENDING
+  // NEW-5 fix (docs/test-report.md "Final Verification"): additive intermediate status
+  // between PENDING and SENT/QUEUED. `outboundService.confirmAndSend` atomically claims a
+  // message from PENDING -> SENDING (a single conditional `UPDATE ... WHERE status =
+  // 'PENDING'`) immediately before calling the channel adapter, so two genuinely concurrent
+  // callers can't both pass the old in-memory "is it PENDING?" guard and both send — only
+  // one caller's claim can ever match. A same-value PENDING -> PENDING "self-claim" doesn't
+  // work for this (a concurrent second claim's WHERE clause still matches after the first
+  // commits, since the value never changed), so a real, distinct status was needed rather
+  // than reusing PENDING itself.
+  SENDING
   SENT
   DELIVERED
   READ
