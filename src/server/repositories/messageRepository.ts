@@ -221,7 +221,8 @@ export const messageRepository = {
   /**
    * Cross-org variant of `listFailedAwaitingRetry` above — the H4 fix's one legitimate
    * exception to "every repository function takes the caller's organizationId" (same
-   * precedent as `channelAccountRepository.findFirstActiveByChannelTypeInOtherOrg`/`findById`).
+   * precedent as `channelAccountRepository.findById`, used to bootstrap a request before its
+   * organizationId is known).
    * Used ONLY by `GET/POST /api/internal/retry-worker` (`src/app/api/internal/retry-worker/
    * route.ts`), which is not a per-org session request — it's an internal, shared-secret
    * protected endpoint an external scheduler hits periodically to drive automatic retries

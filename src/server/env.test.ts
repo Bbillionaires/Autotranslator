@@ -1,10 +1,9 @@
 /**
  * Tests for `src/server/env.ts`'s conditional-requirement logic, per
- * docs/implementation-plan.md §6.7 and the Phase 9 task brief's "extra rigor on the 'boots
- * with zero credentials' requirement". `env.ts` parses `process.env` and throws at MODULE
- * IMPORT TIME, so every case here uses `vi.resetModules()` + a dynamic `await import("./env")`
- * against a freshly-constructed `process.env` snapshot — same pattern as
- * `src/server/channels/index.test.ts`.
+ * docs/implementation-plan.md §6.7 and the Builder task's per-org-credential rewrite.
+ * `env.ts` parses `process.env` and throws at MODULE IMPORT TIME, so every case here uses
+ * `vi.resetModules()` + a dynamic `await import("./env")` against a freshly-constructed
+ * `process.env` snapshot — same pattern as `src/server/channels/index.test.ts`.
  *
  * `process.env` is a single mutable object shared across every test FILE that runs in the
  * same Vitest worker (Node doesn't sandbox its built-in `process` per file the way module
@@ -13,12 +12,14 @@
  * `process.env` by the time this file's tests run. So — rather than trusting whatever
  * `process.env` happens to contain — every test here starts by explicitly DELETING every key
  * `env.ts` reads (`ALL_ENV_KEYS` below) and then sets back only exactly what that specific
- * case needs. This is what makes the "zero WhatsApp vars, keys genuinely ABSENT" assertion
+ * case needs. This is what makes the "zero credentials, keys genuinely ABSENT" assertion
  * trustworthy regardless of test execution order.
  */
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 const ORIGINAL_ENV = { ...process.env };
+
+const VALID_CREDENTIAL_ENCRYPTION_KEY = "a".repeat(64);
 
 /** Every key `src/server/env.ts` reads from `process.env` (see its `rawEnvSchema`). */
 const ALL_ENV_KEYS = [
@@ -36,16 +37,11 @@ const ALL_ENV_KEYS = [
   "EMAIL_FROM",
   "RESEND_API_KEY",
   "TELEGRAM_ENABLED",
-  "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_WEBHOOK_SECRET",
   "ANDROID_GATEWAY_ENABLED",
   "ANDROID_GATEWAY_SIGNING_SECRET",
   "WHATSAPP_ENABLED",
-  "WHATSAPP_ACCESS_TOKEN",
-  "WHATSAPP_PHONE_NUMBER_ID",
-  "WHATSAPP_BUSINESS_ACCOUNT_ID",
-  "WHATSAPP_VERIFY_TOKEN",
-  "WHATSAPP_APP_SECRET",
+  "CREDENTIAL_ENCRYPTION_KEY",
+  "INTERNAL_WORKER_SECRET",
 ] as const;
 
 /** Deletes every `env.ts`-relevant key, then sets only the unconditionally-required base four. */
@@ -71,80 +67,83 @@ afterAll(() => {
 });
 
 describe("env.ts — zero-credential boot (docs/implementation-plan.md §6.7)", () => {
-  it("validates successfully with every WHATSAPP_*/TELEGRAM_*/ANDROID_GATEWAY_* key genuinely ABSENT (not just false)", async () => {
+  it("validates successfully with every WHATSAPP/TELEGRAM/ANDROID_GATEWAY/CREDENTIAL_ENCRYPTION_KEY key genuinely ABSENT (not just false)", async () => {
     resetToUnconditionalBaseEnv();
 
     const { env } = await import("./env");
     expect(env.WHATSAPP_ENABLED).toBe(false);
-    expect(env.WHATSAPP_ACCESS_TOKEN).toBeUndefined();
-    expect(env.WHATSAPP_PHONE_NUMBER_ID).toBeUndefined();
-    expect(env.WHATSAPP_BUSINESS_ACCOUNT_ID).toBeUndefined();
-    expect(env.WHATSAPP_VERIFY_TOKEN).toBeUndefined();
-    expect(env.WHATSAPP_APP_SECRET).toBeUndefined();
     expect(env.TELEGRAM_ENABLED).toBe(false);
     expect(env.ANDROID_GATEWAY_ENABLED).toBe(false);
+    expect(env.CREDENTIAL_ENCRYPTION_KEY).toBeUndefined();
   });
 
-  it("validates successfully with WHATSAPP_ENABLED explicitly 'false' and no other WHATSAPP_* vars set", async () => {
+  it("validates successfully with every *_ENABLED flag explicitly 'false'", async () => {
     resetToUnconditionalBaseEnv();
     process.env.WHATSAPP_ENABLED = "false";
+    process.env.TELEGRAM_ENABLED = "false";
+    process.env.ANDROID_GATEWAY_ENABLED = "false";
 
     const { env } = await import("./env");
     expect(env.WHATSAPP_ENABLED).toBe(false);
+    expect(env.TELEGRAM_ENABLED).toBe(false);
+    expect(env.ANDROID_GATEWAY_ENABLED).toBe(false);
   });
 });
 
-describe("env.ts — WHATSAPP_ENABLED=true requires all five WhatsApp vars", () => {
-  it("throws listing every missing WHATSAPP_* var when none are set", async () => {
+describe("env.ts — CREDENTIAL_ENCRYPTION_KEY conditional requirement", () => {
+  it("throws when TELEGRAM_ENABLED=true and CREDENTIAL_ENCRYPTION_KEY is unset", async () => {
     resetToUnconditionalBaseEnv();
-    process.env.WHATSAPP_ENABLED = "true";
+    process.env.TELEGRAM_ENABLED = "true";
 
-    await expect(import("./env")).rejects.toThrow(/WHATSAPP_ACCESS_TOKEN/);
-    vi.resetModules();
-    await expect(import("./env")).rejects.toThrow(/WHATSAPP_PHONE_NUMBER_ID/);
-    vi.resetModules();
-    await expect(import("./env")).rejects.toThrow(/WHATSAPP_BUSINESS_ACCOUNT_ID/);
-    vi.resetModules();
-    await expect(import("./env")).rejects.toThrow(/WHATSAPP_VERIFY_TOKEN/);
-    vi.resetModules();
-    await expect(import("./env")).rejects.toThrow(/WHATSAPP_APP_SECRET/);
+    await expect(import("./env")).rejects.toThrow(/CREDENTIAL_ENCRYPTION_KEY/);
   });
 
-  it("throws when only some of the five WhatsApp vars are set", async () => {
+  it("throws when WHATSAPP_ENABLED=true and CREDENTIAL_ENCRYPTION_KEY is unset", async () => {
     resetToUnconditionalBaseEnv();
     process.env.WHATSAPP_ENABLED = "true";
-    process.env.WHATSAPP_ACCESS_TOKEN = "token";
-    process.env.WHATSAPP_PHONE_NUMBER_ID = "123456789";
-    // WHATSAPP_BUSINESS_ACCOUNT_ID / WHATSAPP_VERIFY_TOKEN / WHATSAPP_APP_SECRET left unset.
 
-    await expect(import("./env")).rejects.toThrow(/WHATSAPP_BUSINESS_ACCOUNT_ID/);
+    await expect(import("./env")).rejects.toThrow(/CREDENTIAL_ENCRYPTION_KEY/);
   });
 
-  it("validates successfully once all five WhatsApp vars are set alongside WHATSAPP_ENABLED=true", async () => {
+  it("throws when ANDROID_GATEWAY_ENABLED=true and CREDENTIAL_ENCRYPTION_KEY is unset", async () => {
+    resetToUnconditionalBaseEnv();
+    process.env.ANDROID_GATEWAY_ENABLED = "true";
+    process.env.ANDROID_GATEWAY_SIGNING_SECRET = "test-signing-secret";
+
+    await expect(import("./env")).rejects.toThrow(/CREDENTIAL_ENCRYPTION_KEY/);
+  });
+
+  it("throws when CREDENTIAL_ENCRYPTION_KEY is set but the wrong length/format (not 64 hex chars)", async () => {
+    resetToUnconditionalBaseEnv();
+    process.env.TELEGRAM_ENABLED = "true";
+    process.env.CREDENTIAL_ENCRYPTION_KEY = "too-short";
+
+    await expect(import("./env")).rejects.toThrow(/CREDENTIAL_ENCRYPTION_KEY/);
+  });
+
+  it("validates successfully once CREDENTIAL_ENCRYPTION_KEY (64 hex chars) is set alongside TELEGRAM_ENABLED=true", async () => {
+    resetToUnconditionalBaseEnv();
+    process.env.TELEGRAM_ENABLED = "true";
+    process.env.CREDENTIAL_ENCRYPTION_KEY = VALID_CREDENTIAL_ENCRYPTION_KEY;
+
+    const { env } = await import("./env");
+    expect(env.TELEGRAM_ENABLED).toBe(true);
+    expect(env.CREDENTIAL_ENCRYPTION_KEY).toBe(VALID_CREDENTIAL_ENCRYPTION_KEY);
+  });
+
+  it("validates successfully once CREDENTIAL_ENCRYPTION_KEY is set alongside WHATSAPP_ENABLED=true", async () => {
     resetToUnconditionalBaseEnv();
     process.env.WHATSAPP_ENABLED = "true";
-    process.env.WHATSAPP_ACCESS_TOKEN = "test-access-token";
-    process.env.WHATSAPP_PHONE_NUMBER_ID = "123456789";
-    process.env.WHATSAPP_BUSINESS_ACCOUNT_ID = "987654321";
-    process.env.WHATSAPP_VERIFY_TOKEN = "test-verify-token";
-    process.env.WHATSAPP_APP_SECRET = "test-app-secret";
+    process.env.CREDENTIAL_ENCRYPTION_KEY = VALID_CREDENTIAL_ENCRYPTION_KEY;
 
     const { env } = await import("./env");
     expect(env.WHATSAPP_ENABLED).toBe(true);
-    expect(env.WHATSAPP_ACCESS_TOKEN).toBe("test-access-token");
   });
 
-  it("does not throw about Telegram/Android vars it doesn't need when only WhatsApp is enabled", async () => {
+  it("does not require CREDENTIAL_ENCRYPTION_KEY when every channel flag is false", async () => {
     resetToUnconditionalBaseEnv();
-    process.env.WHATSAPP_ENABLED = "true";
-    process.env.WHATSAPP_ACCESS_TOKEN = "test-access-token";
-    process.env.WHATSAPP_PHONE_NUMBER_ID = "123456789";
-    process.env.WHATSAPP_BUSINESS_ACCOUNT_ID = "987654321";
-    process.env.WHATSAPP_VERIFY_TOKEN = "test-verify-token";
-    process.env.WHATSAPP_APP_SECRET = "test-app-secret";
 
     const { env } = await import("./env");
-    expect(env.TELEGRAM_ENABLED).toBe(false);
-    expect(env.ANDROID_GATEWAY_ENABLED).toBe(false);
+    expect(env.CREDENTIAL_ENCRYPTION_KEY).toBeUndefined();
   });
 });

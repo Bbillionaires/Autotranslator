@@ -2,7 +2,8 @@
  * Org-scoped repository for `ChannelAccount`, per docs/implementation-plan.md §6.1. See
  * contactRepository.ts for the `client` param rationale (transaction threading).
  */
-import type { ChannelAccountStatus, ChannelType } from "@prisma/client";
+import type { ChannelAccountStatus, ChannelType, Prisma } from "@prisma/client";
+import type { EncryptedCredentialsBlob } from "../crypto/credentialEncryption";
 import { prisma } from "../db";
 import type { PrismaClientOrTx } from "../db";
 import { NotFoundError } from "../errors";
@@ -12,6 +13,7 @@ export interface CreateChannelAccountInput {
   displayName: string;
   externalAccountId?: string | null;
   credentialRef?: string | null;
+  encryptedCredentials?: EncryptedCredentialsBlob | null;
   status?: ChannelAccountStatus;
 }
 
@@ -37,56 +39,34 @@ export const channelAccountRepository = {
   },
 
   /**
-   * Cross-org existence check — used ONLY by `registerTelegramWebhook`
-   * (`src/server/actions/telegram.ts`) to hard-block a second organization from ever
-   * activating a Telegram `ChannelAccount` while this deployment shares one global
-   * `TELEGRAM_BOT_TOKEN` (see C1 in docs/review-report.md, fixed here: previously nothing
-   * prevented a second org from creating its own ACTIVE Telegram `ChannelAccount`, which
-   * caused every inbound webhook to silently resolve to whichever org's account was
-   * created first — real cross-tenant data leakage). Returns the first ACTIVE
-   * `ChannelAccount` of `channelType` belonging to any organization OTHER than
-   * `organizationId`, or `null` if none exists (the common, single-org case).
-   */
-  async findFirstActiveByChannelTypeInOtherOrg(
-    channelType: ChannelType,
-    organizationId: string,
-    client: PrismaClientOrTx = prisma,
-  ) {
-    return client.channelAccount.findFirst({
-      where: { channelType, status: "ACTIVE", organizationId: { not: organizationId } },
-      orderBy: { createdAt: "asc" },
-    });
-  },
-
-  /**
    * Cross-org lookup by bare id — a legitimate exception to "every repository function
-   * takes the caller's organizationId" (see `findFirstActiveByChannelTypeInOtherOrg` above
-   * for a related precedent). Used ONLY by `src/server/gateways/androidAuth.ts` to
-   * resolve a device's `ChannelAccount` from the deviceId embedded in its signed token,
-   * *before* any `organizationId` is known — unlike every other Android gateway operation,
-   * which is immediately re-scoped to `channelAccount.organizationId` once this lookup
-   * resolves it. Each Android device is genuinely per-org/per-device (its own issued
-   * token), so — unlike Telegram's single-global-bot-token shortcut — this is not a
-   * multi-tenancy shortcut, just the unavoidable bootstrapping step of "whose device is
-   * this token for?".
+   * takes the caller's organizationId", needed whenever the caller must resolve WHICH
+   * organization a request belongs to from an id alone, before any `organizationId` is
+   * known. Used by:
+   *   - `src/server/gateways/androidAuth.ts`, to resolve a device's `ChannelAccount` from
+   *     the deviceId embedded in its signed token — every other Android gateway operation
+   *     is immediately re-scoped to `channelAccount.organizationId` once this resolves it.
+   *   - The per-organization Telegram/WhatsApp webhook routes
+   *     (`src/app/api/channels/telegram/webhook/[channelAccountId]/route.ts`,
+   *     `.../whatsapp/webhook/[channelAccountId]/route.ts`), to resolve the `ChannelAccount`
+   *     named by the webhook URL's path segment — the whole point of the per-account URL
+   *     design is that the URL itself identifies the account, so its org is derived from
+   *     THIS lookup, then that account's own decrypted webhook secret/signature key
+   *     verifies the request actually belongs to it (never trusting the URL alone).
    */
   async findById(id: string, client: PrismaClientOrTx = prisma) {
     return client.channelAccount.findUnique({ where: { id } });
   },
 
   /**
-   * Cross-org lookup by channel type + `externalAccountId` — the WhatsApp analogue of
-   * `listAllActiveByChannelType` below. Used ONLY by the WhatsApp webhook route
-   * (`src/app/api/channels/whatsapp/webhook/route.ts`) to resolve which organization's
-   * `ChannelAccount` an inbound webhook `value` block belongs to, via
-   * `value.metadata.phone_number_id` (§3.5 step 2: "for WhatsApp, the phone_number_id in the
-   * payload") — deliberately per-`phone_number_id`, unlike Telegram's single-global-bot-token
-   * shortcut, since a deployment could in principle have multiple WhatsApp Business phone
-   * numbers each mapped to its own `ChannelAccount.externalAccountId`. Still a documented
-   * MVP simplification in the sense that it doesn't disambiguate two different
-   * *organizations* both somehow registering the same real phone number (shouldn't happen —
-   * a phone number belongs to exactly one WhatsApp Business Account — but nothing in this
-   * schema enforces global uniqueness of `externalAccountId` across orgs).
+   * Cross-org lookup by channel type + `externalAccountId`. Used ONLY by the WhatsApp
+   * webhook route to resolve which organization's `ChannelAccount` an inbound webhook
+   * `value` block belongs to, via `value.metadata.phone_number_id` (§3.5 step 2) — kept for
+   * that one call site; the per-account webhook route itself resolves by `ChannelAccount.id`
+   * (`findById` above), not by this lookup. Global uniqueness of
+   * `(channelType, externalAccountId)` is now enforced at the DB level (see
+   * `prisma/schema.prisma`'s `ChannelAccount` doc comment), so this can never return more
+   * than one row across organizations.
    */
   async findActiveByChannelTypeAndExternalAccountId(
     channelType: ChannelType,
@@ -122,9 +102,44 @@ export const channelAccountRepository = {
         displayName: input.displayName,
         externalAccountId: input.externalAccountId ?? undefined,
         credentialRef: input.credentialRef ?? undefined,
+        encryptedCredentials: (input.encryptedCredentials as unknown as Prisma.InputJsonValue | undefined) ?? undefined,
         status: input.status,
       },
     });
+  },
+
+  /**
+   * Updates an existing `ChannelAccount`'s encrypted credentials (and, typically alongside
+   * them, its `externalAccountId`/`displayName`/`status`) — the "connect/reconnect a
+   * Telegram bot or WhatsApp account" write path (`src/server/actions/telegram.ts`,
+   * `.../whatsapp.ts`). Distinct from `create` because re-registering an org's channel
+   * (e.g. rotating the bot token, or re-entering WhatsApp credentials after they expired)
+   * updates the SAME `ChannelAccount` row rather than creating a second one for that org.
+   */
+  async updateCredentials(
+    organizationId: string,
+    id: string,
+    input: {
+      displayName?: string;
+      externalAccountId?: string | null;
+      encryptedCredentials: EncryptedCredentialsBlob;
+      status?: ChannelAccountStatus;
+    },
+    client: PrismaClientOrTx = prisma,
+  ) {
+    const result = await client.channelAccount.updateMany({
+      where: { id, organizationId },
+      data: {
+        displayName: input.displayName,
+        externalAccountId: input.externalAccountId,
+        encryptedCredentials: input.encryptedCredentials as unknown as Prisma.InputJsonValue,
+        status: input.status,
+      },
+    });
+    if (result.count === 0) {
+      throw new NotFoundError("Channel account not found.", { organizationId, id });
+    }
+    return channelAccountRepository.findByIdInOrgOrThrow(organizationId, id, client);
   },
 
   async updateStatus(

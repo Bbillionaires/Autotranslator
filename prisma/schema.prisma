@@ -246,9 +246,20 @@ model ChannelAccount {
   channelType          ChannelType
   displayName          String
   externalAccountId    String?
-  // Reference to a secret in the encryption/secrets layer — never the raw credential.
-  // See security section (6.6) for the production encryption plan.
+  // Deprecated/unused: an earlier placeholder for "a reference to a secret in some external
+  // secrets layer" (see docs/review-report.md L2). Superseded by `encryptedCredentials`
+  // below, which stores the real thing (encrypted) rather than a reference to it. Left in
+  // place (additive-only migration policy) rather than dropped.
   credentialRef        String?
+  // Per-organization channel credentials, encrypted at rest (AES-256-GCM via
+  // CREDENTIAL_ENCRYPTION_KEY — see src/server/crypto/credentialEncryption.ts). Holds an
+  // `EncryptedCredentialsBlob` (`{ iv, authTag, ciphertext }`) whose decrypted plaintext is
+  // itself a channel-specific JSON object: Telegram stores `{ botToken, webhookSecret }`;
+  // WhatsApp stores `{ accessToken, phoneNumberId, businessAccountId, appSecret,
+  // verifyToken }`. Null for channel types that don't use this mechanism (ANDROID_SMS keeps
+  // its existing `deviceTokenHash` design — a one-way hash, not a decryptable credential —
+  // and never populates this field) and for rows not yet connected.
+  encryptedCredentials Json?
   status               ChannelAccountStatus @default(PENDING_SETUP)
   // Phase 8 additive fields (docs/implementation-plan.md §6.3/§5 — Android SMS gateway
   // device tracking). `ChannelAccount` doubles as the device record for ANDROID_SMS
@@ -272,7 +283,21 @@ model ChannelAccount {
   identities    ContactChannelIdentity[]
   conversations Conversation[]
 
-  @@unique([organizationId, channelType, externalAccountId])
+  // Builder task ("per-org channel credentials"): this used to be
+  // `@@unique([organizationId, channelType, externalAccountId])` — a PER-ORG uniqueness
+  // guarantee that was really a band-aid for the single-global-bot-token design (C1,
+  // docs/review-report.md): it stopped a second org from creating its OWN row claiming the
+  // same externalAccountId, but said nothing about a *different* org claiming the exact
+  // same externalAccountId, because that was the only way multi-org Telegram could ever
+  // work before real per-org credentials existed. Now that each org has genuinely distinct
+  // credentials (and a genuinely distinct webhook path keyed by ChannelAccount.id), the
+  // invariant that actually matters is stronger and simpler: a given external account
+  // (e.g. one specific Telegram bot id, or one specific WhatsApp phone_number_id) may
+  // belong to at most ONE ChannelAccount, full stop — never two, and therefore never two
+  // different organizations. Postgres treats every NULL externalAccountId as distinct from
+  // every other NULL, so PENDING_SETUP rows with no externalAccountId yet never conflict
+  // with each other.
+  @@unique([channelType, externalAccountId])
   @@index([organizationId])
 }
 

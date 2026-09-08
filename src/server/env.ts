@@ -53,21 +53,35 @@ const rawEnvSchema = z.object({
   RESEND_API_KEY: z.string().optional(),
 
   // ---- Telegram ----
+  // TELEGRAM_ENABLED remains a global feature flag (gates whether the adapter/routes exist
+  // at all). There is deliberately no global TELEGRAM_BOT_TOKEN/TELEGRAM_WEBHOOK_SECRET any
+  // more — bot credentials are now per-organization, entered via Settings and stored
+  // encrypted on ChannelAccount.encryptedCredentials (see
+  // src/server/channels/telegram/credentials.ts and docs/channel-adapters.md).
   TELEGRAM_ENABLED: booleanFlag,
-  TELEGRAM_BOT_TOKEN: z.string().optional(),
-  TELEGRAM_WEBHOOK_SECRET: z.string().optional(),
 
   // ---- Android SMS gateway ----
   ANDROID_GATEWAY_ENABLED: booleanFlag,
   ANDROID_GATEWAY_SIGNING_SECRET: z.string().optional(),
 
   // ---- WhatsApp Business Cloud API ----
+  // WHATSAPP_ENABLED remains a global feature flag; the five credential vars this used to
+  // require (WHATSAPP_ACCESS_TOKEN/PHONE_NUMBER_ID/BUSINESS_ACCOUNT_ID/VERIFY_TOKEN/
+  // APP_SECRET) are gone the same way Telegram's are — per-organization credentials now,
+  // see src/server/channels/whatsapp/credentials.ts.
   WHATSAPP_ENABLED: booleanFlag,
-  WHATSAPP_ACCESS_TOKEN: z.string().optional(),
-  WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
-  WHATSAPP_BUSINESS_ACCOUNT_ID: z.string().optional(),
-  WHATSAPP_VERIFY_TOKEN: z.string().optional(),
-  WHATSAPP_APP_SECRET: z.string().optional(),
+
+  // ---- Per-organization channel credential encryption ----
+  // AES-256-GCM key (32 bytes, hex-encoded — 64 hex characters) used to encrypt/decrypt
+  // every ChannelAccount's stored credentials (see src/server/crypto/credentialEncryption.ts).
+  // Generate one for local dev with: openssl rand -hex 32
+  // Required only when at least one channel that stores per-org credentials this way is
+  // enabled (TELEGRAM_ENABLED, WHATSAPP_ENABLED, or ANDROID_GATEWAY_ENABLED) — preserving
+  // the zero-credential-boot guarantee for a deployment with every channel disabled.
+  CREDENTIAL_ENCRYPTION_KEY: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/i, "CREDENTIAL_ENCRYPTION_KEY must be 64 hex characters (32 bytes, e.g. from `openssl rand -hex 32`)")
+    .optional(),
 
   // ---- Internal retry worker (H4 fix, docs/review-report.md) ----
   // Optional-but-recommended: protects GET/POST /api/internal/retry-worker (the endpoint an
@@ -84,34 +98,22 @@ type RawEnv = z.infer<typeof rawEnvSchema>;
 function collectConditionalErrors(env: RawEnv): string[] {
   const errors: string[] = [];
 
-  if (env.TELEGRAM_ENABLED) {
-    if (!env.TELEGRAM_BOT_TOKEN) {
-      errors.push("TELEGRAM_BOT_TOKEN is required when TELEGRAM_ENABLED=true");
-    }
-    if (!env.TELEGRAM_WEBHOOK_SECRET) {
-      errors.push("TELEGRAM_WEBHOOK_SECRET is required when TELEGRAM_ENABLED=true");
-    }
-  }
-
   if (env.ANDROID_GATEWAY_ENABLED) {
     if (!env.ANDROID_GATEWAY_SIGNING_SECRET) {
       errors.push("ANDROID_GATEWAY_SIGNING_SECRET is required when ANDROID_GATEWAY_ENABLED=true");
     }
   }
 
-  if (env.WHATSAPP_ENABLED) {
-    const requiredWhatsAppVars: Array<[keyof RawEnv, string]> = [
-      ["WHATSAPP_ACCESS_TOKEN", "WHATSAPP_ACCESS_TOKEN"],
-      ["WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_PHONE_NUMBER_ID"],
-      ["WHATSAPP_BUSINESS_ACCOUNT_ID", "WHATSAPP_BUSINESS_ACCOUNT_ID"],
-      ["WHATSAPP_VERIFY_TOKEN", "WHATSAPP_VERIFY_TOKEN"],
-      ["WHATSAPP_APP_SECRET", "WHATSAPP_APP_SECRET"],
-    ];
-    for (const [key, name] of requiredWhatsAppVars) {
-      if (!env[key]) {
-        errors.push(`${name} is required when WHATSAPP_ENABLED=true`);
-      }
-    }
+  // CREDENTIAL_ENCRYPTION_KEY guards per-organization channel credentials at rest
+  // (src/server/crypto/credentialEncryption.ts). Required whenever a channel that stores
+  // credentials this way could be enabled — Telegram and WhatsApp always do; Android is
+  // included per the same conditional-requirement spirit even though its existing
+  // device-token-hash mechanism doesn't itself need this key, so a deployment turning any
+  // one of the three on always has it available.
+  if ((env.TELEGRAM_ENABLED || env.WHATSAPP_ENABLED || env.ANDROID_GATEWAY_ENABLED) && !env.CREDENTIAL_ENCRYPTION_KEY) {
+    errors.push(
+      "CREDENTIAL_ENCRYPTION_KEY is required when TELEGRAM_ENABLED, WHATSAPP_ENABLED, or ANDROID_GATEWAY_ENABLED is true",
+    );
   }
 
   if (env.TRANSLATION_PROVIDER === "openai" && !env.OPENAI_API_KEY) {
