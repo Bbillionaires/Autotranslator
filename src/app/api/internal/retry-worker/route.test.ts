@@ -83,6 +83,27 @@ async function setUpFailedMessage(opts: { scheduledForPast: boolean }) {
   return { organization, channelAccount, message };
 }
 
+describe("GET/POST /api/internal/retry-worker — NEW-4 rate limiting", () => {
+  it("returns 429 once a single IP exceeds the webhook rate limit, before any secret check runs", async () => {
+    delete process.env.INTERNAL_WORKER_SECRET;
+    vi.resetModules();
+    const { WEBHOOK_RATE_LIMIT } = await import("@/server/rateLimit");
+    const { GET } = await import("./route");
+    const ip = `203.0.113.${Math.floor(Math.random() * 200) + 1}`; // unique per test run
+
+    for (let i = 0; i < WEBHOOK_RATE_LIMIT.limit; i++) {
+      // No INTERNAL_WORKER_SECRET configured (would otherwise 503) — proves the rate limit
+      // is enforced BEFORE the secret-configuration/comparison check, same precedent as the
+      // Telegram/WhatsApp webhook routes.
+      const res = await GET(new Request("https://example.com/api/internal/retry-worker", { headers: { "x-forwarded-for": ip } }));
+      expect(res.status).toBe(503);
+    }
+
+    const limited = await GET(new Request("https://example.com/api/internal/retry-worker", { headers: { "x-forwarded-for": ip } }));
+    expect(limited.status).toBe(429);
+  });
+});
+
 describe("GET/POST /api/internal/retry-worker — auth", () => {
   it("returns 503 when INTERNAL_WORKER_SECRET is not configured (fails closed, not open)", async () => {
     delete process.env.INTERNAL_WORKER_SECRET;

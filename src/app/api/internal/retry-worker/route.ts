@@ -37,7 +37,19 @@
  *
  * See README.md's "Scheduling the retry worker in production" section for
  * Vercel Cron / self-hosted cron config examples.
+ *
+ * ## NEW-4 fix (docs/test-report.md): constant-time secret comparison + rate limiting
+ * The shared-secret comparison below uses `node:crypto`'s `timingSafeEqual` instead of a
+ * plain `!==`, matching every other secret/signature comparison in this codebase (Telegram
+ * webhook secret, WhatsApp HMAC/verify-token, Android device-token hash) — each of those
+ * keeps its own small self-contained `constantTimeEquals` copy rather than a shared
+ * abstraction (see e.g. `androidAuth.ts`'s doc comment on that helper), so this route follows
+ * that same established precedent instead of introducing a new cross-cutting module for one
+ * more call site. This route is also now rate-limited (`webhookRateLimiter`, the same generic
+ * limiter every other public/webhook-adjacent route already uses) — it's a public HTTP route
+ * guarded only by a static shared secret, so it deserves the same flood protection.
  */
+import { timingSafeEqual } from "node:crypto";
 import { channelAdapterRegistry } from "@/server/channels";
 import { env } from "@/server/env";
 import { conversationRepository } from "@/server/repositories/conversationRepository";
@@ -46,19 +58,46 @@ import { messageRepository } from "@/server/repositories/messageRepository";
 import { retryMessage } from "@/server/messaging/outboundService";
 import { runRetryWorkerOnce, type RetryableMessageLike } from "@/server/messaging/retryQueue";
 import { withContext } from "@/server/logger";
+import { getClientIp, rateLimitedResponse, webhookRateLimiter } from "@/server/rateLimit";
 
 function unauthorized(): Response {
   return Response.json({ error: "unauthorized" }, { status: 401 });
 }
 
+/**
+ * Constant-time string comparison — same pattern as `TelegramAdapter`'s/`WhatsAppAdapter`'s/
+ * `androidAuth.ts`'s local `constantTimeEquals` (one small self-contained copy per file,
+ * matching that established precedent rather than a premature shared abstraction). Falls
+ * back to comparing a buffer against itself on length mismatch (still constant-time for that
+ * buffer's length) since `timingSafeEqual` requires equal-length inputs and an early
+ * `return false` on length mismatch would itself leak the secret's length via timing.
+ */
+function constantTimeEquals(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) {
+    timingSafeEqual(bufA, bufA);
+    return false;
+  }
+  return timingSafeEqual(bufA, bufB);
+}
+
 async function handle(req: Request): Promise<Response> {
+  // NEW-4 fix: rate-limited per-IP, before any secret check or DB/adapter work — a flood
+  // (valid or invalid secret) shouldn't get further than this, same precedent as the
+  // Telegram/WhatsApp webhook routes.
+  const rateLimit = webhookRateLimiter.check(getClientIp(req));
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse();
+  }
+
   if (!env.INTERNAL_WORKER_SECRET) {
     // Fail closed: no "insecure but functional" fallback for an internal, cross-org endpoint.
     return Response.json({ error: "Retry worker is not configured (INTERNAL_WORKER_SECRET unset)." }, { status: 503 });
   }
 
   const provided = req.headers.get("x-internal-worker-secret");
-  if (!provided || provided !== env.INTERNAL_WORKER_SECRET) {
+  if (!provided || !constantTimeEquals(provided, env.INTERNAL_WORKER_SECRET)) {
     return unauthorized();
   }
 
