@@ -68,6 +68,33 @@ export const contactChannelIdentityRepository = {
     });
   },
 
+  /**
+   * M4 fix (docs/review-report.md): re-points an existing `ContactChannelIdentity` at a
+   * different `Contact` in the same org — the primitive `connectChannelIdentity`
+   * (`src/server/actions/contacts.ts`) uses to merge duplicate identities (e.g. a contact
+   * who first messaged as a "new" identity that should have matched an existing `Contact`,
+   * per the H5 race). Scoped via `updateMany` + a relation filter (same org-scoping shape as
+   * `contactRepository.update`) since Prisma's unique `update` can't filter by a relation
+   * directly. Re-pointing only `contactId` can never violate
+   * `@@unique([channelAccountId, externalContactId])` — that constraint is keyed by the
+   * identity's own channel account + external id, neither of which this touches.
+   */
+  async reassignContact(
+    organizationId: string,
+    id: string,
+    targetContactId: string,
+    client: PrismaClientOrTx = prisma,
+  ) {
+    const result = await client.contactChannelIdentity.updateMany({
+      where: { id, channelAccount: { organizationId } },
+      data: { contactId: targetContactId },
+    });
+    if (result.count === 0) {
+      throw new NotFoundError("Contact channel identity not found.", { organizationId, id });
+    }
+    return contactChannelIdentityRepository.findByIdInOrgOrThrow(organizationId, id, client);
+  },
+
   async create(
     organizationId: string,
     input: CreateContactChannelIdentityInput,

@@ -22,7 +22,9 @@ const { prisma } = await import("../db");
 const { organizationRepository } = await import("../repositories/organizationRepository");
 const { contactRepository } = await import("../repositories/contactRepository");
 const { userRepository } = await import("../repositories/userRepository");
-const { setContactLanguage, createContact, updateContact, archiveContact } = await import("./contacts");
+const { channelAccountRepository } = await import("../repositories/channelAccountRepository");
+const { contactChannelIdentityRepository } = await import("../repositories/contactChannelIdentityRepository");
+const { setContactLanguage, createContact, updateContact, archiveContact, connectChannelIdentity } = await import("./contacts");
 
 function fakeSession(role: Session["user"]["role"], organizationId: string, userId = "u1"): Session {
   return { user: { id: userId, organizationId, role }, expires: "" } as Session;
@@ -180,5 +182,115 @@ describe("archiveContact", () => {
     const auditRows = await prisma.auditLog.findMany({ where: { organizationId, entityType: "Contact", entityId: contact.id } });
     expect(auditRows).toHaveLength(1);
     expect(auditRows[0].action).toBe("contact.archived");
+  });
+});
+
+describe("connectChannelIdentity", () => {
+  async function setUpTwoContactsWithIdentity() {
+    const organization = await organizationRepository.create({ name: `ConnectIdentity Test Org ${Date.now()}-${Math.random()}` });
+    organizationId = organization.id;
+    const channelAccount = await channelAccountRepository.create(organizationId, {
+      channelType: "TELEGRAM",
+      displayName: "Test Bot",
+      status: "ACTIVE",
+    });
+    const sourceContact = await contactRepository.create(organizationId, { displayName: "Duplicate Contact" });
+    const targetContact = await contactRepository.create(organizationId, { displayName: "Real Contact" });
+    const identity = await contactChannelIdentityRepository.create(organizationId, {
+      contactId: sourceContact.id,
+      channelAccountId: channelAccount.id,
+      externalContactId: `ext-${Date.now()}-${Math.random()}`,
+    });
+    return { sourceContact, targetContact, identity };
+  }
+
+  it("rejects a session below Manager (e.g. Agent)", async () => {
+    const { targetContact, identity } = await setUpTwoContactsWithIdentity();
+    vi.mocked(auth).mockResolvedValue(fakeSession("AGENT", organizationId));
+
+    const result = await connectChannelIdentity({ contactChannelIdentityId: identity.id, contactId: targetContact.id });
+    expect(result.ok).toBe(false);
+
+    const unchanged = await contactChannelIdentityRepository.findByIdInOrgOrThrow(organizationId, identity.id);
+    expect(unchanged.contactId).toBe(identity.contactId);
+  });
+
+  it("re-points the identity to the target contact for a Manager+ session and writes an AuditLog row", async () => {
+    const { targetContact, identity } = await setUpTwoContactsWithIdentity();
+    const actingUser = await userRepository.create({
+      organizationId,
+      name: "Acting Manager",
+      email: `acting-manager-${Date.now()}-${Math.random()}@test.dev`,
+      role: "MANAGER",
+    });
+    vi.mocked(auth).mockResolvedValue(fakeSession("MANAGER", organizationId, actingUser.id));
+
+    const result = await connectChannelIdentity({ contactChannelIdentityId: identity.id, contactId: targetContact.id });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.data.contactId).toBe(targetContact.id);
+
+    const stored = await contactChannelIdentityRepository.findByIdInOrgOrThrow(organizationId, identity.id);
+    expect(stored.contactId).toBe(targetContact.id);
+
+    const auditRows = await prisma.auditLog.findMany({
+      where: { organizationId, entityType: "ContactChannelIdentity", entityId: identity.id },
+    });
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0].action).toBe("contact_channel_identity.merged");
+  });
+
+  it("is a no-op (and does not audit-log) when the identity is already linked to the target contact", async () => {
+    const { sourceContact, identity } = await setUpTwoContactsWithIdentity();
+    const actingUser = await userRepository.create({
+      organizationId,
+      name: "Acting Manager",
+      email: `acting-manager-${Date.now()}-${Math.random()}@test.dev`,
+      role: "MANAGER",
+    });
+    vi.mocked(auth).mockResolvedValue(fakeSession("MANAGER", organizationId, actingUser.id));
+
+    const result = await connectChannelIdentity({ contactChannelIdentityId: identity.id, contactId: sourceContact.id });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.data.contactId).toBe(sourceContact.id);
+
+    const auditRows = await prisma.auditLog.findMany({
+      where: { organizationId, entityType: "ContactChannelIdentity", entityId: identity.id },
+    });
+    expect(auditRows).toHaveLength(0);
+  });
+
+  it("cannot connect an identity to a contact in a different organization (cross-org rejection)", async () => {
+    const { identity } = await setUpTwoContactsWithIdentity();
+    const otherOrg = await organizationRepository.create({ name: `Other Org ${Date.now()}-${Math.random()}` });
+    const otherContact = await contactRepository.create(otherOrg.id, { displayName: "Other Org Contact" });
+    const actingUser = await userRepository.create({
+      organizationId,
+      name: "Acting Manager",
+      email: `acting-manager-${Date.now()}-${Math.random()}@test.dev`,
+      role: "MANAGER",
+    });
+    vi.mocked(auth).mockResolvedValue(fakeSession("MANAGER", organizationId, actingUser.id));
+
+    const result = await connectChannelIdentity({ contactChannelIdentityId: identity.id, contactId: otherContact.id });
+    expect(result.ok).toBe(false);
+
+    const unchanged = await contactChannelIdentityRepository.findByIdInOrgOrThrow(organizationId, identity.id);
+    expect(unchanged.contactId).toBe(identity.contactId);
+
+    await prisma.organization.deleteMany({ where: { id: otherOrg.id } });
+  });
+
+  it("cannot connect an identity belonging to a different organization even with a valid target contact id (cross-org rejection)", async () => {
+    const { identity } = await setUpTwoContactsWithIdentity();
+    const otherOrg = await organizationRepository.create({ name: `Other Org 2 ${Date.now()}-${Math.random()}` });
+    const otherOrgTarget = await contactRepository.create(otherOrg.id, { displayName: "Other Org Target" });
+    vi.mocked(auth).mockResolvedValue(fakeSession("MANAGER", otherOrg.id));
+
+    const result = await connectChannelIdentity({ contactChannelIdentityId: identity.id, contactId: otherOrgTarget.id });
+    expect(result.ok).toBe(false);
+
+    await prisma.organization.deleteMany({ where: { id: otherOrg.id } });
   });
 });

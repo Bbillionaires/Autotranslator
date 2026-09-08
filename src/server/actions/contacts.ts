@@ -18,10 +18,11 @@
  * for Phase 10 rather than silently decided.
  */
 import { z } from "zod";
-import type { Contact } from "@prisma/client";
+import type { Contact, ContactChannelIdentity } from "@prisma/client";
 import { auth } from "../auth";
 import { toSafeActionError } from "../errors";
 import { auditLogRepository } from "../repositories/auditLogRepository";
+import { contactChannelIdentityRepository } from "../repositories/contactChannelIdentityRepository";
 import { contactRepository } from "../repositories/contactRepository";
 import { requireRole } from "../roles";
 
@@ -141,6 +142,72 @@ export async function archiveContact(input: z.infer<typeof archiveContactSchema>
     });
 
     return { ok: true, data: { archived: true } };
+  } catch (error) {
+    return { ok: false, ...toSafeActionError(error) };
+  }
+}
+
+/**
+ * Server Action `connectChannelIdentity`, per §5 ("Link a `ContactChannelIdentity` to a
+ * contact (merge duplicate identities) | Session+Role(Manager+)") — M4 fix
+ * (docs/review-report.md). Used when two `Contact` records turn out to be the same human
+ * across different first-contact events (e.g. a contact whose first message created a "new"
+ * identity that should have matched an existing `Contact`): re-points the
+ * `ContactChannelIdentity` at the target contact instead.
+ *
+ * Both the identity and the target contact are resolved via org-scoped
+ * `findByIdInOrgOrThrow` lookups first, so a cross-org id for either one fails closed with
+ * `NotFoundError` before any write is attempted. Already-linked (`identity.contactId ===
+ * targetContactId`) is a no-op, not an error — and not audit-logged, since nothing actually
+ * changed. Re-pointing `contactId` alone can never collide with
+ * `@@unique([channelAccountId, externalContactId])` (verified: that constraint is keyed by
+ * the identity's own channel account + external id, neither of which this touches).
+ */
+const connectChannelIdentitySchema = z.object({
+  contactChannelIdentityId: z.string().min(1),
+  contactId: z.string().min(1),
+});
+export type ConnectChannelIdentityInput = z.infer<typeof connectChannelIdentitySchema>;
+
+export async function connectChannelIdentity(
+  input: ConnectChannelIdentityInput,
+): Promise<ActionResult<ContactChannelIdentity>> {
+  try {
+    const session = await auth();
+    requireRole(session?.user?.role, "MANAGER");
+    const organizationId = session!.user.organizationId;
+
+    const parsed = connectChannelIdentitySchema.parse(input);
+
+    const identity = await contactChannelIdentityRepository.findByIdInOrgOrThrow(
+      organizationId,
+      parsed.contactChannelIdentityId,
+    );
+    // Org-scoped existence check on the target contact — throws NotFoundError for a
+    // cross-org id, matching every other cross-entity Server Action in this file.
+    await contactRepository.findByIdInOrgOrThrow(organizationId, parsed.contactId);
+
+    if (identity.contactId === parsed.contactId) {
+      // Already linked to this contact — a benign no-op, not an error.
+      return { ok: true, data: identity };
+    }
+
+    const updated = await contactChannelIdentityRepository.reassignContact(
+      organizationId,
+      parsed.contactChannelIdentityId,
+      parsed.contactId,
+    );
+
+    await auditLogRepository.record({
+      organizationId,
+      userId: session!.user.id,
+      action: "contact_channel_identity.merged",
+      entityType: "ContactChannelIdentity",
+      entityId: parsed.contactChannelIdentityId,
+      metadata: { fromContactId: identity.contactId, toContactId: parsed.contactId },
+    });
+
+    return { ok: true, data: updated };
   } catch (error) {
     return { ok: false, ...toSafeActionError(error) };
   }

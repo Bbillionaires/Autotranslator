@@ -12,6 +12,7 @@ import { ChannelIcon } from "@/components/channel-icon";
 import { languageLabel } from "@/lib/languages";
 import { ArchiveContactButton } from "./archive-button";
 import { ContactEditForm } from "./contact-edit-form";
+import { ReassignIdentityButton } from "./reassign-identity-button";
 
 export default async function ContactDetailPage({ params }: { params: Promise<{ contactId: string }> }) {
   const { contactId } = await params;
@@ -57,9 +58,10 @@ export default async function ContactDetailPage({ params }: { params: Promise<{ 
           <h2 className="text-sm font-semibold text-foreground">Connected channels</h2>
           <ul className="flex flex-col gap-2">
             {contact.identities.map((identity) => (
-              <li key={identity.id} className="flex items-center gap-2 text-sm">
+              <li key={identity.id} className="flex flex-wrap items-center gap-2 text-sm">
                 <ChannelIcon channel={identity.channelAccount.channelType} />
                 <span className="text-foreground">{identity.externalUsername ?? identity.externalContactId}</span>
+                <ReassignIdentityButton contactChannelIdentityId={identity.id} canReassign={roleAtLeast(role, "MANAGER")} />
               </li>
             ))}
             {contact.identities.length === 0 && <li className="text-sm text-muted">No connected channels.</li>}
