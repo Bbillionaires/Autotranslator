@@ -1,88 +1,65 @@
 /**
- * Unit tests for `WhatsAppAdapter`. No live network call is ever made — `global.fetch` is
- * mocked in every test, per the Phase 9 task brief's "No live network calls to Meta's Graph
- * API anywhere in tests — mock fetch" working rule.
+ * Unit tests for `WhatsAppAdapter`, rewritten for per-organization WhatsApp credentials. No
+ * live network call is ever made — `global.fetch` is mocked in every test.
  */
 import { createHmac } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // NOTE: env-dependent modules must be dynamically imported AFTER the process.env
 // assignments below — same rationale as telegram/adapter.test.ts's top-of-file comment
-// (static imports are hoisted and would freeze `env.WHATSAPP_*` as undefined).
+// (static imports are hoisted and would freeze `env.CREDENTIAL_ENCRYPTION_KEY` as undefined).
 process.env.WHATSAPP_ENABLED ??= "true";
-process.env.WHATSAPP_ACCESS_TOKEN ??= "test-access-token";
-process.env.WHATSAPP_PHONE_NUMBER_ID ??= "1234567890";
-process.env.WHATSAPP_BUSINESS_ACCOUNT_ID ??= "waba-test-id";
-process.env.WHATSAPP_VERIFY_TOKEN ??= "test-verify-token";
-process.env.WHATSAPP_APP_SECRET ??= "test-app-secret";
+process.env.CREDENTIAL_ENCRYPTION_KEY ??= "fa".repeat(32);
 
 const { UpstreamAdapterError } = await import("../../errors");
-const { WhatsAppAdapter } = await import("./adapter");
+const { WhatsAppAdapter, verifyWhatsAppSignature } = await import("./adapter");
 const { classifyAdapterFailure } = await import("../../messaging/failureClassifier");
+const { encryptWhatsAppCredentials } = await import("./credentials");
+
+const FIXED_CREDENTIALS = {
+  accessToken: "test-access-token",
+  phoneNumberId: "1234567890",
+  businessAccountId: "waba-test-id",
+  appSecret: "test-app-secret",
+  verifyToken: "test-verify-token",
+};
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 }
 
-function signedRequest(body: unknown, secret = "test-app-secret"): Request {
-  const raw = JSON.stringify(body);
-  const signature = `sha256=${createHmac("sha256", secret).update(raw).digest("hex")}`;
-  return new Request("https://example.com/api/channels/whatsapp/webhook", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Hub-Signature-256": signature },
-    body: raw,
-  });
+function fakeChannelAccount(credentials: typeof FIXED_CREDENTIALS = FIXED_CREDENTIALS) {
+  return { encryptedCredentials: encryptWhatsAppCredentials(credentials) } as never;
 }
 
-describe("WhatsAppAdapter.validateWebhook", () => {
-  let adapter: InstanceType<typeof WhatsAppAdapter>;
-
-  beforeEach(() => {
-    adapter = new WhatsAppAdapter();
-  });
-
-  it("accepts a request whose X-Hub-Signature-256 matches the HMAC-SHA256 of the raw body using WHATSAPP_APP_SECRET", async () => {
-    const req = signedRequest({ object: "whatsapp_business_account", entry: [] });
-    expect(await adapter.validateWebhook(req)).toBe(true);
-  });
-
-  it("rejects a request whose body was tampered with after signing (signature no longer matches)", async () => {
+describe("verifyWhatsAppSignature", () => {
+  it("accepts a signature computed over the raw body with the correct appSecret", () => {
     const raw = JSON.stringify({ object: "whatsapp_business_account", entry: [] });
-    const signature = `sha256=${createHmac("sha256", "test-app-secret").update(raw).digest("hex")}`;
-    const tampered = new Request("https://example.com/webhook", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Hub-Signature-256": signature },
-      body: JSON.stringify({ object: "whatsapp_business_account", entry: [{ id: "injected" }] }),
-    });
-    expect(await adapter.validateWebhook(tampered)).toBe(false);
+    const header = `sha256=${createHmac("sha256", "test-app-secret").update(raw).digest("hex")}`;
+    expect(verifyWhatsAppSignature(header, raw, "test-app-secret")).toBe(true);
   });
 
-  it("rejects a request signed with the wrong secret", async () => {
-    const req = signedRequest({ object: "whatsapp_business_account", entry: [] }, "wrong-secret");
-    expect(await adapter.validateWebhook(req)).toBe(false);
+  it("rejects a body that was tampered with after signing", () => {
+    const original = JSON.stringify({ object: "whatsapp_business_account", entry: [] });
+    const header = `sha256=${createHmac("sha256", "test-app-secret").update(original).digest("hex")}`;
+    const tampered = JSON.stringify({ object: "whatsapp_business_account", entry: [{ id: "injected" }] });
+    expect(verifyWhatsAppSignature(header, tampered, "test-app-secret")).toBe(false);
   });
 
-  it("rejects a request with no X-Hub-Signature-256 header at all", async () => {
-    const req = new Request("https://example.com/webhook", { method: "POST", body: "{}" });
-    expect(await adapter.validateWebhook(req)).toBe(false);
+  it("rejects a signature computed with a DIFFERENT organization's appSecret", () => {
+    const raw = JSON.stringify({ object: "whatsapp_business_account", entry: [] });
+    const header = `sha256=${createHmac("sha256", "org-a-secret").update(raw).digest("hex")}`;
+    expect(verifyWhatsAppSignature(header, raw, "org-b-secret")).toBe(false);
   });
 
-  it("rejects a header missing the 'sha256=' prefix", async () => {
+  it("rejects a missing header", () => {
+    expect(verifyWhatsAppSignature(null, "{}", "test-app-secret")).toBe(false);
+  });
+
+  it("rejects a header missing the 'sha256=' prefix", () => {
     const raw = "{}";
     const bareHex = createHmac("sha256", "test-app-secret").update(raw).digest("hex");
-    const req = new Request("https://example.com/webhook", {
-      method: "POST",
-      headers: { "X-Hub-Signature-256": bareHex },
-      body: raw,
-    });
-    expect(await adapter.validateWebhook(req)).toBe(false);
-  });
-
-  it("leaves the original request's body readable afterward (clone-before-read, not consume-then-fail)", async () => {
-    const req = signedRequest({ object: "whatsapp_business_account", entry: [{ id: "x" }] });
-    expect(await adapter.validateWebhook(req)).toBe(true);
-    const body = (await req.json()) as { entry: unknown[] };
-    expect(body.entry).toHaveLength(1);
+    expect(verifyWhatsAppSignature(bareHex, raw, "test-app-secret")).toBe(false);
   });
 });
 
@@ -100,11 +77,11 @@ describe("WhatsAppAdapter.sendMessage", () => {
     vi.unstubAllGlobals();
   });
 
-  it("POSTs a text message to the Graph API messages endpoint and returns SENT with the WhatsApp message id", async () => {
+  it("decrypts this org's own credentials and POSTs a text message to the Graph API messages endpoint", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ messaging_product: "whatsapp", messages: [{ id: "wamid.OUT1" }] }));
 
     const result = await adapter.sendMessage({
-      channelAccount: {} as never,
+      channelAccount: fakeChannelAccount(),
       externalContactId: "5215512345678",
       text: "Hello!",
     });
@@ -123,10 +100,33 @@ describe("WhatsAppAdapter.sendMessage", () => {
     });
   });
 
+  it("uses a DIFFERENT organization's own phoneNumberId/accessToken when given a different channelAccount", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ messages: [{ id: "wamid.A" }] }));
+    await adapter.sendMessage({
+      channelAccount: fakeChannelAccount({ ...FIXED_CREDENTIALS, accessToken: "org-a-token", phoneNumberId: "111" }),
+      externalContactId: "1",
+      text: "hi",
+    });
+    const [urlA, initA] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(urlA).toContain("111");
+    expect((initA.headers as Record<string, string>).Authorization).toBe("Bearer org-a-token");
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ messages: [{ id: "wamid.B" }] }));
+    await adapter.sendMessage({
+      channelAccount: fakeChannelAccount({ ...FIXED_CREDENTIALS, accessToken: "org-b-token", phoneNumberId: "222" }),
+      externalContactId: "1",
+      text: "hi",
+    });
+    const [urlB, initB] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(urlB).toContain("222");
+    expect((initB.headers as Record<string, string>).Authorization).toBe("Bearer org-b-token");
+    expect(urlA).not.toBe(urlB);
+  });
+
   it("includes a context.message_id when replyToExternalId is set", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ messages: [{ id: "wamid.OUT2" }] }));
     await adapter.sendMessage({
-      channelAccount: {} as never,
+      channelAccount: fakeChannelAccount(),
       externalContactId: "5215512345678",
       text: "Reply",
       replyToExternalId: "wamid.PARENT",
@@ -139,7 +139,7 @@ describe("WhatsAppAdapter.sendMessage", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ error: { message: "Invalid recipient phone number", code: 131030 } }, 400));
 
     try {
-      await adapter.sendMessage({ channelAccount: {} as never, externalContactId: "bad-number", text: "Hi" });
+      await adapter.sendMessage({ channelAccount: fakeChannelAccount(), externalContactId: "bad-number", text: "Hi" });
       expect.fail("expected sendMessage to throw");
     } catch (error) {
       expect(error).toBeInstanceOf(UpstreamAdapterError);
@@ -151,7 +151,7 @@ describe("WhatsAppAdapter.sendMessage", () => {
     fetchMock.mockResolvedValue(jsonResponse({ error: { message: "Too many requests" } }, 429));
 
     try {
-      await adapter.sendMessage({ channelAccount: {} as never, externalContactId: "5215512345678", text: "Hi" });
+      await adapter.sendMessage({ channelAccount: fakeChannelAccount(), externalContactId: "5215512345678", text: "Hi" });
       expect.fail("expected sendMessage to throw");
     } catch (error) {
       expect(error).toBeInstanceOf(UpstreamAdapterError);
@@ -163,7 +163,7 @@ describe("WhatsAppAdapter.sendMessage", () => {
     fetchMock.mockResolvedValue(jsonResponse({ error: { message: "Internal error" } }, 500));
 
     try {
-      await adapter.sendMessage({ channelAccount: {} as never, externalContactId: "5215512345678", text: "Hi" });
+      await adapter.sendMessage({ channelAccount: fakeChannelAccount(), externalContactId: "5215512345678", text: "Hi" });
       expect.fail("expected sendMessage to throw");
     } catch (error) {
       expect(classifyAdapterFailure(error)).toBe("transient");
@@ -174,7 +174,7 @@ describe("WhatsAppAdapter.sendMessage", () => {
     fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
 
     try {
-      await adapter.sendMessage({ channelAccount: {} as never, externalContactId: "5215512345678", text: "Hi" });
+      await adapter.sendMessage({ channelAccount: fakeChannelAccount(), externalContactId: "5215512345678", text: "Hi" });
       expect.fail("expected sendMessage to throw");
     } catch (error) {
       expect(error).toBeInstanceOf(UpstreamAdapterError);
@@ -201,6 +201,7 @@ describe("WhatsAppAdapter.sendTemplateMessage", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ messages: [{ id: "wamid.TEMPLATE1" }] }));
 
     const result = await adapter.sendTemplateMessage({
+      channelAccount: fakeChannelAccount(),
       externalContactId: "5215512345678",
       templateName: "order_confirmation",
       languageCode: "es_MX",
@@ -225,7 +226,12 @@ describe("WhatsAppAdapter.sendTemplateMessage", () => {
 
   it("omits components entirely when none are supplied", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ messages: [{ id: "wamid.TEMPLATE2" }] }));
-    await adapter.sendTemplateMessage({ externalContactId: "5215512345678", templateName: "simple_ping", languageCode: "en_US" });
+    await adapter.sendTemplateMessage({
+      channelAccount: fakeChannelAccount(),
+      externalContactId: "5215512345678",
+      templateName: "simple_ping",
+      languageCode: "en_US",
+    });
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
     expect(body.template.components).toBeUndefined();
@@ -235,52 +241,32 @@ describe("WhatsAppAdapter.sendTemplateMessage", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ error: { message: "Template name does not exist in the translation.", code: 132001 } }, 400));
 
     await expect(
-      adapter.sendTemplateMessage({ externalContactId: "5215512345678", templateName: "nonexistent", languageCode: "en_US" }),
+      adapter.sendTemplateMessage({
+        channelAccount: fakeChannelAccount(),
+        externalContactId: "5215512345678",
+        templateName: "nonexistent",
+        languageCode: "en_US",
+      }),
     ).rejects.toThrow(UpstreamAdapterError);
   });
 });
 
-describe("WhatsAppAdapter — NotConfiguredError when credentials are missing", () => {
-  // `env.ts` itself already refuses to boot with `WHATSAPP_ENABLED=true` and a missing
-  // access token/phone number id (§6.7's conditional-requirement validation — see
-  // env.test.ts), so that exact combination can never occur through the REAL env module in
-  // a running process. `requireCredentials()`/`healthCheck()`'s own guards are still real
-  // defense-in-depth (e.g. against a future refactor of env.ts's invariant, or any code path
-  // that constructs an adapter against a differently-validated env), so this test exercises
-  // them directly via `vi.doMock` on the `env` module — bypassing real env.ts validation
-  // entirely — rather than trying to reach an unreachable real-world process state.
+describe("WhatsAppAdapter — errors when a channelAccount has no stored credentials", () => {
   afterEach(() => {
-    vi.doUnmock("../../env");
     vi.unstubAllGlobals();
-    vi.resetModules();
   });
 
-  it("sendMessage throws NotConfiguredError if WHATSAPP_ACCESS_TOKEN/WHATSAPP_PHONE_NUMBER_ID aren't set", async () => {
-    // A safety net, not the point of this test: if the env mock below somehow didn't take
-    // effect, this stub still guarantees no live network call happens.
+  it("sendMessage throws when the channelAccount has no encryptedCredentials", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("unexpected live network call in test")));
+    const adapter = new WhatsAppAdapter();
 
-    vi.resetModules();
-    // Spread over the REAL env (`vi.importActual`) rather than replacing the module wholesale
-    // — logger.ts (transitively imported by errors.ts) also reads `env.LOG_LEVEL`/`env.NODE_ENV`,
-    // so a bare `{ env: { WHATSAPP_ACCESS_TOKEN: undefined } }` factory would leave those
-    // unset and crash pino's construction with an unrelated error.
-    vi.doMock("../../env", async () => {
-      const actual = await vi.importActual<typeof import("../../env")>("../../env");
-      return { env: { ...actual.env, WHATSAPP_ENABLED: true, WHATSAPP_ACCESS_TOKEN: undefined, WHATSAPP_PHONE_NUMBER_ID: undefined } };
-    });
-
-    const { WhatsAppAdapter: FreshAdapter } = await import("./adapter");
-    const { NotConfiguredError: FreshNotConfiguredError } = await import("../../errors");
-    const adapter = new FreshAdapter();
-
-    await expect(adapter.sendMessage({ channelAccount: {} as never, externalContactId: "555", text: "hi" })).rejects.toThrow(
-      FreshNotConfiguredError,
-    );
+    await expect(
+      adapter.sendMessage({ channelAccount: { encryptedCredentials: null } as never, externalContactId: "555", text: "hi" }),
+    ).rejects.toThrow();
   });
 });
 
-describe("WhatsAppAdapter.healthCheck", () => {
+describe("WhatsAppAdapter.checkCredentialsHealth / checkAccountHealth", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -292,19 +278,28 @@ describe("WhatsAppAdapter.healthCheck", () => {
     vi.unstubAllGlobals();
   });
 
-  it("reports healthy with the phone number's display name on a successful Graph API call", async () => {
+  it("checkCredentialsHealth reports healthy with the phone number's display name on a successful Graph API call", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ display_phone_number: "+1 555 000 1111", verified_name: "Acme Demo Co" }));
 
     const adapter = new WhatsAppAdapter();
-    const health = await adapter.healthCheck();
+    const health = await adapter.checkCredentialsHealth(FIXED_CREDENTIALS);
     expect(health).toEqual({ healthy: true, detail: "+1 555 000 1111" });
+  });
+
+  it("checkAccountHealth decrypts the channelAccount's own credentials and reports the same result", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ display_phone_number: "+1 555 000 2222" }));
+    const adapter = new WhatsAppAdapter();
+    const health = await adapter.checkAccountHealth(fakeChannelAccount());
+    expect(health).toEqual({ healthy: true, detail: "+1 555 000 2222" });
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain(FIXED_CREDENTIALS.phoneNumberId);
   });
 
   it("reports unhealthy with a detail message when the Graph API call fails", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ error: { message: "Invalid OAuth access token" } }, 401));
 
     const adapter = new WhatsAppAdapter();
-    const health = await adapter.healthCheck();
+    const health = await adapter.checkCredentialsHealth(FIXED_CREDENTIALS);
     expect(health.healthy).toBe(false);
     expect(health.detail).toContain("Invalid OAuth access token");
   });
@@ -312,47 +307,23 @@ describe("WhatsAppAdapter.healthCheck", () => {
   it("reports unhealthy on a network-level failure", async () => {
     fetchMock.mockRejectedValueOnce(new TypeError("network down"));
     const adapter = new WhatsAppAdapter();
-    const health = await adapter.healthCheck();
+    const health = await adapter.checkCredentialsHealth(FIXED_CREDENTIALS);
     expect(health.healthy).toBe(false);
     expect(health.detail).toBeTruthy();
   });
 
-  it("returns {healthy: false, detail: ...} without throwing when WHATSAPP_ENABLED is false, even if called directly", async () => {
-    vi.resetModules();
-    const originalEnabled = process.env.WHATSAPP_ENABLED;
-    process.env.WHATSAPP_ENABLED = "false";
-
-    const { WhatsAppAdapter: FreshAdapter } = await import("./adapter");
-    const adapter = new FreshAdapter();
-    const health = await adapter.healthCheck();
+  it("checkAccountHealth reports unhealthy (without throwing) when the account has no stored credentials", async () => {
+    const adapter = new WhatsAppAdapter();
+    const health = await adapter.checkAccountHealth({ encryptedCredentials: null } as never);
     expect(health.healthy).toBe(false);
-    expect(health.detail).toMatch(/not enabled/i);
-    expect(fetchMock).not.toHaveBeenCalled();
-
-    if (originalEnabled) process.env.WHATSAPP_ENABLED = originalEnabled;
-    vi.resetModules();
   });
+});
 
-  it("returns {healthy: false, ...} without throwing when enabled but access token/phone number id are missing", async () => {
-    // Same rationale as the `NotConfiguredError` describe block above: this exact
-    // combination can't occur through the real, validated `env` module (env.ts refuses to
-    // boot with WHATSAPP_ENABLED=true and a missing token), so `env` is mocked (spread over
-    // the real module via `vi.importActual` so logger.ts's LOG_LEVEL/NODE_ENV reads still
-    // work) to exercise `healthCheck()`'s own defensive guard in isolation.
-    vi.resetModules();
-    vi.doMock("../../env", async () => {
-      const actual = await vi.importActual<typeof import("../../env")>("../../env");
-      return { env: { ...actual.env, WHATSAPP_ENABLED: true, WHATSAPP_ACCESS_TOKEN: undefined, WHATSAPP_PHONE_NUMBER_ID: "1234567890" } };
-    });
-
-    const { WhatsAppAdapter: FreshAdapter } = await import("./adapter");
-    const adapter = new FreshAdapter();
+describe("WhatsAppAdapter.healthCheck (parameterless, interface-required)", () => {
+  it("reports the adapter as registered, without needing any per-org credential", async () => {
+    const adapter = new WhatsAppAdapter();
     const health = await adapter.healthCheck();
-    expect(health.healthy).toBe(false);
-    expect(fetchMock).not.toHaveBeenCalled();
-
-    vi.doUnmock("../../env");
-    vi.resetModules();
+    expect(health.healthy).toBe(true);
   });
 });
 
