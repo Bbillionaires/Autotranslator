@@ -10,6 +10,7 @@ import type { Message } from "@prisma/client";
 
 vi.mock("@/server/actions/messages", () => ({
   retryConversationMessage: vi.fn(async () => ({ ok: true, data: {} })),
+  retryInboundMessageTranslation: vi.fn(async () => ({ ok: true, data: {} })),
 }));
 
 const { MessageThread } = await import("./message-thread");
@@ -84,6 +85,29 @@ describe("MessageThread", () => {
 
     rerender(<MessageThread messages={[failed]} canRetry={true} />);
     expect(screen.getByRole("button", { name: /^retry$/i })).toBeInTheDocument();
+  });
+
+  // NEW-3 fix (docs/test-report.md): mirrors the outbound-retry test above, but for a FAILED
+  // INBOUND message — `handleRetry` must branch to `retryInboundMessageTranslation`, not
+  // `retryConversationMessage`, for this direction (see message-thread.tsx's doc comment).
+  it("shows a retry button for a FAILED inbound message and calls retryInboundMessageTranslation on click", async () => {
+    const { retryInboundMessageTranslation, retryConversationMessage } = await import("@/server/actions/messages");
+    const failedInbound = makeMessage({
+      id: "m5",
+      direction: "INBOUND",
+      status: "FAILED",
+      translatedText: null,
+      originalText: "Bonjour, comment allez-vous?",
+    });
+
+    render(<MessageThread messages={[failedInbound]} canRetry={true} />);
+    const retryButton = screen.getByRole("button", { name: /^retry$/i });
+    expect(retryButton).toBeInTheDocument();
+
+    fireEvent.click(retryButton);
+
+    expect(retryInboundMessageTranslation).toHaveBeenCalledWith({ messageId: "m5" });
+    expect(retryConversationMessage).not.toHaveBeenCalled();
   });
 
   it("renders a delivery-status badge for outbound messages", () => {
