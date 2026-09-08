@@ -45,7 +45,26 @@ import { verifyCredentials } from "./credentialsAuth";
 import { refreshSessionTokenClaims, type SessionTokenClaims } from "./authTokenRefresh";
 import { userRepository } from "./repositories/userRepository";
 import type { Role } from "@prisma/client";
+import { env } from "./env";
 import "./auth.types";
+
+// `trustHost: true` (below) makes Auth.js accept whatever Host/X-Forwarded-Host header the
+// reverse proxy hands it for CSRF/origin validation — necessary, but not sufficient. Some
+// proxies (observed on Railway) forward an internal container address (e.g.
+// `localhost:8080`) as that header rather than the real public hostname, and Auth.js uses
+// that same header to build the base URL for sign-in/callback redirects. Without this, a
+// successful credentials sign-in redirects the browser to
+// `https://localhost:8080/` — unreachable from the user's actual device — even though the
+// session itself was created correctly (this exact bug shipped once: CSRF/authorize worked
+// in a header-less `curl` reproduction, but a real browser followed the bad redirect and
+// failed to load). Setting `AUTH_URL` from our own already-required, already-validated
+// `APP_URL` (see src/server/env.ts) makes Auth.js use that instead of inferring it from
+// possibly-wrong proxy headers, on every deployment target (Railway, Vercel, ...), not just
+// the one where this was first caught. Only sets it if not already present, so an operator
+// can still override via a real `AUTH_URL` env var if they ever need to.
+if (!process.env.AUTH_URL) {
+  process.env.AUTH_URL = env.APP_URL;
+}
 
 /**
  * How often a session's JWT is re-issued and, per the `jwt` callback below, has its
