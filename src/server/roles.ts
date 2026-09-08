@@ -1,26 +1,18 @@
 /**
- * Role ordering and guard, per docs/implementation-plan.md §6.2:
- * OWNER(4) > ADMINISTRATOR(3) > MANAGER(2) > AGENT(1) > VIEWER(0).
+ * Server-side role guard, per docs/implementation-plan.md §6.2.
  *
  * `requireRole()` is the single guard Server Actions and Route Handlers should call at
  * the top of any mutation/sensitive read — enforced server-side, never just hidden in the
- * UI. Full usage across every service function lands alongside those services in later
- * phases; this establishes the guard itself plus the nav-visibility use in Phase 3.
+ * UI. The underlying rank table and `roleAtLeast()` live in `src/lib/roles.ts` (no
+ * server-only dependencies) so Client Components can import the ordering directly for
+ * nav-visibility without pulling this module's `ForbiddenError`/logger/env import chain
+ * into the client bundle.
  */
 import type { Role } from "@prisma/client";
 import { ForbiddenError } from "./errors";
 
-export const ROLE_RANK: Record<Role, number> = {
-  VIEWER: 0,
-  AGENT: 1,
-  MANAGER: 2,
-  ADMINISTRATOR: 3,
-  OWNER: 4,
-};
-
-export function roleAtLeast(role: Role, minRole: Role): boolean {
-  return ROLE_RANK[role] >= ROLE_RANK[minRole];
-}
+export { ROLE_RANK, roleAtLeast } from "@/lib/roles";
+import { roleAtLeast } from "@/lib/roles";
 
 /**
  * Throws ForbiddenError if `role` does not meet `minRole`. Call from Server Actions /

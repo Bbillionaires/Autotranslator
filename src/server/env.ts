@@ -5,6 +5,18 @@
  * throws a descriptive error (listing every missing/invalid variable) if validation fails.
  * It is imported from server-only code paths (never from client components).
  *
+ * The `import "server-only"` below turns any future violation of that rule into a
+ * build-time error instead of a silent runtime crash. Without it, a Client Component that
+ * transitively imports this module (even several hops away, e.g. via a shared server
+ * utility that isn't itself guarded) gets it bundled into client-side JavaScript, where
+ * `process.env` has none of the real secrets — this module's own eager validation then
+ * throws unconditionally on every real page load in the browser, which is exactly how a
+ * real production incident happened here (`(app)/nav.tsx`, a Client Component, imported
+ * `roleAtLeast` from `src/server/roles.ts`, which pulled in `errors.ts` -> `logger.ts` ->
+ * this file). That import chain has been severed (the rank table now lives in
+ * `src/lib/roles.ts`, which has no server-only dependencies), and this guard stays so the
+ * next accidental chain fails loudly at build time instead of silently in a user's browser.
+ *
  * Conditional-requirement rules (exactly as specified in the plan):
  *  - WHATSAPP_* vars are required only when WHATSAPP_ENABLED === "true".
  *  - ANDROID_GATEWAY_SIGNING_SECRET is required only when ANDROID_GATEWAY_ENABLED === "true".
@@ -16,6 +28,7 @@
  * AUTH_SECRET / APP_URL set, validation must pass — this is the Phase 3 "zero-credential
  * boot" acceptance test.
  */
+import "server-only";
 import { z } from "zod";
 
 const booleanFlag = z

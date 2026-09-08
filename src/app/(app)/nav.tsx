@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation";
 import { signOut } from "next-auth/react";
 import type { Role } from "@prisma/client";
 import { NAV_ITEMS } from "./nav-items";
-import { roleAtLeast } from "@/server/roles";
+import { roleAtLeast } from "@/lib/roles";
 
 export function Nav({
   role,

@@ -41,6 +41,15 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // Every test file here exercises server-side code. Vitest has no notion of Next.js's
+      // "react-server" resolve condition — the mechanism that makes `import "server-only"`
+      // (added to src/server/env.ts) resolve to a no-op in a real server build and to a
+      // throwing stub in a client build. Without this alias, `server-only`'s package.json
+      // "default" export resolves to that throwing stub unconditionally, so any server
+      // module importing it (e.g. env.ts) fails every test that imports it — even though
+      // these are all server-context tests. Point it at the same no-op the real build uses
+      // for server code.
+      "server-only": path.resolve(__dirname, "./node_modules/server-only/empty.js"),
     },
   },
 });
