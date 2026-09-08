@@ -6,7 +6,7 @@
  * send), and renders the thread + composer + sidebar + assignment controls.
  */
 import Link from "next/link";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { auth } from "@/server/auth";
 import { roleAtLeast } from "@/server/roles";
 import { conversationRepository } from "@/server/repositories/conversationRepository";
@@ -28,8 +28,13 @@ export default async function ConversationPage({
 }) {
   const { conversationId } = await params;
   const session = await auth();
-  const organizationId = session!.user.organizationId;
-  const role = session!.user.role;
+  // Per-page guard, independent of `(app)/layout.tsx`'s own check — see inbox/page.tsx's
+  // identical comment for why a layout-level redirect alone isn't sufficient here.
+  if (!session?.user) {
+    redirect("/sign-in");
+  }
+  const organizationId = session.user.organizationId;
+  const role = session.user.role;
 
   let conversation;
   try {

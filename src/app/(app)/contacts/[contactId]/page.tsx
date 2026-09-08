@@ -3,7 +3,7 @@
  * conversation history (link into conversations), archive action").
  */
 import Link from "next/link";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { auth } from "@/server/auth";
 import { roleAtLeast } from "@/server/roles";
 import { contactRepository } from "@/server/repositories/contactRepository";
@@ -17,8 +17,13 @@ import { ReassignIdentityButton } from "./reassign-identity-button";
 export default async function ContactDetailPage({ params }: { params: Promise<{ contactId: string }> }) {
   const { contactId } = await params;
   const session = await auth();
-  const organizationId = session!.user.organizationId;
-  const role = session!.user.role;
+  // Per-page guard, independent of `(app)/layout.tsx`'s own check — see inbox/page.tsx's
+  // identical comment for why a layout-level redirect alone isn't sufficient here.
+  if (!session?.user) {
+    redirect("/sign-in");
+  }
+  const organizationId = session.user.organizationId;
+  const role = session.user.role;
 
   let contact;
   try {

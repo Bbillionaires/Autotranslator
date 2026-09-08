@@ -4,6 +4,7 @@
  * `contactRepository.listForContactsPage`, and renders a create form + the list.
  */
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import type { ChannelType } from "@prisma/client";
 import { auth } from "@/server/auth";
 import { roleAtLeast } from "@/server/roles";
@@ -24,8 +25,13 @@ export default async function ContactsPage({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const session = await auth();
-  const organizationId = session!.user.organizationId;
-  const role = session!.user.role;
+  // Per-page guard, independent of `(app)/layout.tsx`'s own check — see inbox/page.tsx's
+  // identical comment for why a layout-level redirect alone isn't sufficient here.
+  if (!session?.user) {
+    redirect("/sign-in");
+  }
+  const organizationId = session.user.organizationId;
+  const role = session.user.role;
   const params = await searchParams;
 
   const q = firstParam(params.q)?.trim() || undefined;

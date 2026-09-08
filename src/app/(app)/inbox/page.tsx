@@ -5,6 +5,7 @@
  * needed for filtering — see filters-form.tsx's doc comment.
  */
 import type { ChannelType, ConversationStatus } from "@prisma/client";
+import { redirect } from "next/navigation";
 import { auth } from "@/server/auth";
 import { channelAccountRepository } from "@/server/repositories/channelAccountRepository";
 import { contactRepository } from "@/server/repositories/contactRepository";
@@ -26,7 +27,17 @@ export default async function InboxPage({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const session = await auth();
-  const organizationId = session!.user.organizationId;
+  // Belt-and-suspenders per-page guard: `(app)/layout.tsx` already redirects to /sign-in
+  // when unauthenticated, but Next.js does not guarantee that a layout's `redirect()` runs
+  // to completion before a sibling page segment's own `auth()` call resolves — the two can
+  // execute concurrently during rendering. Relying solely on the layout's check left this
+  // exact `session!.user` assertion able to throw an unhandled
+  // "Cannot read properties of null (reading 'user')" TypeError under that race (observed in
+  // production), instead of cleanly redirecting. Every page in `(app)/` must check for itself.
+  if (!session?.user) {
+    redirect("/sign-in");
+  }
+  const organizationId = session.user.organizationId;
   const params = await searchParams;
 
   const q = firstParam(params.q)?.trim() || undefined;
