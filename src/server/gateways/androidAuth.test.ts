@@ -10,6 +10,7 @@ import { configureTestDatabaseEnv } from "../messaging/__tests__/testDb";
 
 configureTestDatabaseEnv();
 process.env.ANDROID_GATEWAY_ENABLED = "true";
+process.env.CREDENTIAL_ENCRYPTION_KEY ??= "fe".repeat(32);
 process.env.ANDROID_GATEWAY_SIGNING_SECRET = "test-signing-secret-do-not-use-in-prod";
 
 const { prisma } = await import("../db");

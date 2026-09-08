@@ -27,8 +27,7 @@ import { configureTestDatabaseEnv } from "@/server/messaging/__tests__/testDb";
 
 configureTestDatabaseEnv();
 process.env.TELEGRAM_ENABLED = "true";
-process.env.TELEGRAM_BOT_TOKEN = "test-bot-token";
-process.env.TELEGRAM_WEBHOOK_SECRET = "test-webhook-secret";
+process.env.CREDENTIAL_ENCRYPTION_KEY = "89".repeat(32);
 
 vi.mock("@/server/auth", () => ({ auth: vi.fn(async (): Promise<import("next-auth").Session | null> => null) }));
 
@@ -45,7 +44,8 @@ const { FakeChannelAdapter } = await import("@/server/channels/__tests__/fakeAda
 const { createContact, setContactLanguage } = await import("@/server/actions/contacts");
 const { assignConversation, setConversationLanguageOverride } = await import("@/server/actions/conversations");
 const { sendConversationMessage, retryConversationMessage } = await import("@/server/actions/messages");
-const { POST: telegramWebhookPOST } = await import("../api/channels/telegram/webhook/route");
+const { encryptTelegramCredentials } = await import("@/server/channels/telegram/credentials");
+const { POST: telegramWebhookPOST } = await import("../api/channels/telegram/webhook/[channelAccountId]/route");
 
 function fakeSession(role: Session["user"]["role"], organizationId: string, userId: string): Session {
   return { user: { id: userId, organizationId, role }, expires: "" } as Session;
@@ -72,12 +72,18 @@ afterEach(async () => {
   await prisma.organization.deleteMany({ where: { id: { in: [organizationId, otherOrgId].filter(Boolean) } } });
 });
 
-function telegramUpdateRequest(body: unknown): Request {
-  return new Request("https://example.com/api/channels/telegram/webhook", {
+const E2E_WEBHOOK_SECRET = "test-webhook-secret";
+
+function telegramUpdateRequest(channelAccountId: string, body: unknown): Request {
+  return new Request(`https://example.com/api/channels/telegram/webhook/${channelAccountId}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret" },
+    headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": E2E_WEBHOOK_SECRET },
     body: JSON.stringify(body),
   });
+}
+
+function invokeTelegramWebhook(channelAccountId: string, body: unknown) {
+  return telegramWebhookPOST(telegramUpdateRequest(channelAccountId, body), { params: Promise.resolve({ channelAccountId }) });
 }
 
 describe("End-to-end administrator scenario (product brief, Tester phase)", () => {
@@ -95,6 +101,8 @@ describe("End-to-end administrator scenario (product brief, Tester phase)", () =
     const channelAccount = await channelAccountRepository.create(organizationId, {
       channelType: "TELEGRAM",
       displayName: "E2E Test Bot",
+      externalAccountId: `e2e-bot-${organizationId}`,
+      encryptedCredentials: encryptTelegramCredentials({ botToken: "e2e-bot-token", webhookSecret: E2E_WEBHOOK_SECRET }),
       status: "ACTIVE",
     });
     vi.mocked(auth).mockResolvedValue(fakeSession("ADMINISTRATOR", organizationId, admin.id));
@@ -132,7 +140,7 @@ describe("End-to-end administrator scenario (product brief, Tester phase)", () =
         date: Math.floor(Date.now() / 1000),
       },
     };
-    const webhookRes = await telegramWebhookPOST(telegramUpdateRequest(inboundUpdate));
+    const webhookRes = await invokeTelegramWebhook(channelAccount.id, inboundUpdate);
     expect(webhookRes.status).toBe(200);
 
     const conversation = await conversationRepository.findByContactAndChannelAccount(organizationId, contact.id, channelAccount.id);

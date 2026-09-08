@@ -15,8 +15,7 @@ afterEach(() => {
 describe("registerChannelAdapters — Telegram", () => {
   it("registers TelegramAdapter when TELEGRAM_ENABLED=true", async () => {
     process.env.TELEGRAM_ENABLED = "true";
-    process.env.TELEGRAM_BOT_TOKEN = "test-token";
-    process.env.TELEGRAM_WEBHOOK_SECRET = "test-secret";
+    process.env.CREDENTIAL_ENCRYPTION_KEY = "cc".repeat(32);
 
     const { registerChannelAdapters, channelAdapterRegistry } = await import("./index");
     registerChannelAdapters();
@@ -33,8 +32,7 @@ describe("registerChannelAdapters — Telegram", () => {
 
   it("is safe to call twice (no ConflictError on repeated registration)", async () => {
     process.env.TELEGRAM_ENABLED = "true";
-    process.env.TELEGRAM_BOT_TOKEN = "test-token";
-    process.env.TELEGRAM_WEBHOOK_SECRET = "test-secret";
+    process.env.CREDENTIAL_ENCRYPTION_KEY = "cc".repeat(32);
 
     const { registerChannelAdapters } = await import("./index");
     expect(() => {
@@ -62,24 +60,22 @@ describe("registerChannelAdapters — WhatsApp", () => {
 
   it("does not register WhatsAppAdapter when WHATSAPP_ENABLED is left entirely unset", async () => {
     delete process.env.WHATSAPP_ENABLED;
-    delete process.env.WHATSAPP_ACCESS_TOKEN;
-    delete process.env.WHATSAPP_PHONE_NUMBER_ID;
-    delete process.env.WHATSAPP_BUSINESS_ACCOUNT_ID;
-    delete process.env.WHATSAPP_VERIFY_TOKEN;
-    delete process.env.WHATSAPP_APP_SECRET;
+    delete process.env.CREDENTIAL_ENCRYPTION_KEY;
+    // Also reset TELEGRAM_ENABLED/ANDROID_GATEWAY_ENABLED — process.env is shared across
+    // test cases (and files) in this worker, so an earlier case in this same file setting
+    // TELEGRAM_ENABLED="true" would otherwise make env.ts require CREDENTIAL_ENCRYPTION_KEY
+    // here too, unrelated to what THIS test is actually checking.
+    process.env.TELEGRAM_ENABLED = "false";
+    process.env.ANDROID_GATEWAY_ENABLED = "false";
 
     const { registerChannelAdapters, channelAdapterRegistry } = await import("./index");
     registerChannelAdapters();
     expect(channelAdapterRegistry.get("WHATSAPP")).toBeUndefined();
   });
 
-  it("registers WhatsAppAdapter when WHATSAPP_ENABLED=true with valid config", async () => {
+  it("registers WhatsAppAdapter when WHATSAPP_ENABLED=true", async () => {
     process.env.WHATSAPP_ENABLED = "true";
-    process.env.WHATSAPP_ACCESS_TOKEN = "test-access-token";
-    process.env.WHATSAPP_PHONE_NUMBER_ID = "1234567890";
-    process.env.WHATSAPP_BUSINESS_ACCOUNT_ID = "waba-id";
-    process.env.WHATSAPP_VERIFY_TOKEN = "test-verify-token";
-    process.env.WHATSAPP_APP_SECRET = "test-app-secret";
+    process.env.CREDENTIAL_ENCRYPTION_KEY = "dd".repeat(32);
 
     const { registerChannelAdapters, channelAdapterRegistry } = await import("./index");
     registerChannelAdapters();
@@ -89,11 +85,7 @@ describe("registerChannelAdapters — WhatsApp", () => {
 
   it("is safe to call twice (no ConflictError on repeated registration)", async () => {
     process.env.WHATSAPP_ENABLED = "true";
-    process.env.WHATSAPP_ACCESS_TOKEN = "test-access-token";
-    process.env.WHATSAPP_PHONE_NUMBER_ID = "1234567890";
-    process.env.WHATSAPP_BUSINESS_ACCOUNT_ID = "waba-id";
-    process.env.WHATSAPP_VERIFY_TOKEN = "test-verify-token";
-    process.env.WHATSAPP_APP_SECRET = "test-app-secret";
+    process.env.CREDENTIAL_ENCRYPTION_KEY = "dd".repeat(32);
 
     const { registerChannelAdapters } = await import("./index");
     expect(() => {

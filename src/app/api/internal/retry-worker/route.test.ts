@@ -11,8 +11,7 @@ import { configureTestDatabaseEnv } from "@/server/messaging/__tests__/testDb";
 
 configureTestDatabaseEnv();
 process.env.TELEGRAM_ENABLED = "true";
-process.env.TELEGRAM_BOT_TOKEN = "test-bot-token";
-process.env.TELEGRAM_WEBHOOK_SECRET = "test-webhook-secret";
+process.env.CREDENTIAL_ENCRYPTION_KEY = "ba".repeat(32);
 
 const { prisma } = await import("@/server/db");
 const { organizationRepository } = await import("@/server/repositories/organizationRepository");
@@ -22,6 +21,7 @@ const { contactChannelIdentityRepository } = await import("@/server/repositories
 const { conversationRepository } = await import("@/server/repositories/conversationRepository");
 const { messageEventRepository } = await import("@/server/repositories/messageEventRepository");
 const { registerChannelAdapters } = await import("@/server/channels");
+const { encryptTelegramCredentials } = await import("@/server/channels/telegram/credentials");
 
 registerChannelAdapters();
 
@@ -49,6 +49,8 @@ async function setUpFailedMessage(opts: { scheduledForPast: boolean }) {
   const channelAccount = await channelAccountRepository.create(organization.id, {
     channelType: "TELEGRAM",
     displayName: "Test Bot",
+    externalAccountId: `retry-worker-bot-${organization.id}`,
+    encryptedCredentials: encryptTelegramCredentials({ botToken: "retry-worker-bot-token", webhookSecret: "retry-worker-webhook-secret" }),
     status: "ACTIVE",
   });
   const contact = await contactRepository.create(organization.id, { displayName: "Retry Contact" });
