@@ -5,33 +5,89 @@ dev vs. production) for each `MessagingChannelAdapter` (see
 [`docs/implementation-plan.md`](./implementation-plan.md) §3.2 for the interface and
 architecture). It is referenced from the [README](../README.md#channel-adapters).
 
-## Telegram (Phase 6 — fully implemented)
+## Per-organization credential encryption
 
-### 1. Create a bot with @BotFather
+Telegram and WhatsApp credentials are stored per-organization, encrypted at rest, on
+`ChannelAccount.encryptedCredentials` — never as global deployment-wide env vars, and never
+as plaintext in the database.
+
+- **Algorithm**: AES-256-GCM (`src/server/crypto/credentialEncryption.ts`), keyed from
+  `CREDENTIAL_ENCRYPTION_KEY` (32 bytes, hex-encoded — 64 hex characters). Generate one for
+  local dev with `openssl rand -hex 32`. GCM is authenticated: a tampered ciphertext/IV/auth
+  tag is rejected loudly (decryption throws) rather than silently returning corrupted
+  plaintext.
+- **On-disk shape**: `{ iv, authTag, ciphertext }`, each a base64 string, stored as the JSON
+  value of `ChannelAccount.encryptedCredentials`. A fresh random IV is generated on every
+  encrypt call.
+- **What's encrypted**: Telegram stores `{ botToken, webhookSecret }`
+  (`src/server/channels/telegram/credentials.ts`); WhatsApp stores `{ accessToken,
+  phoneNumberId, businessAccountId, appSecret, verifyToken }`
+  (`src/server/channels/whatsapp/credentials.ts`).
+- **When it's required**: `CREDENTIAL_ENCRYPTION_KEY` is required (env.ts's conditional-
+  requirement validation) whenever `TELEGRAM_ENABLED`, `WHATSAPP_ENABLED`, or
+  `ANDROID_GATEWAY_ENABLED` is `true` — never required with every channel flag left
+  false/unset, preserving the zero-credential-boot guarantee. The Android SMS gateway itself
+  doesn't need this key to function (its device-token mechanism is a one-way sha256 hash,
+  never a decryptable secret — see that section below) but is included in the requirement
+  for consistency, since a deployment enabling any one of the three channels should have
+  this key available regardless.
+- **Key rotation — not implemented, a known limitation.** There is no key-versioning scheme:
+  rotating `CREDENTIAL_ENCRYPTION_KEY` would make every previously-encrypted
+  `ChannelAccount` row undecryptable. A real rotation story would need either a key id
+  stored alongside each blob (so old ciphertext stays decryptable with its original key
+  while new writes use the current one) or a one-time re-encrypt-everything migration run
+  at rotation time. Flagged here, not built.
+- **Never commit a real `CREDENTIAL_ENCRYPTION_KEY` value** — it's a local-dev/deployment
+  secret like any other, generated once per environment via `openssl rand -hex 32`.
+
+## Telegram (Phase 6 — fully implemented; per-organization credentials since the Builder's
+multi-tenant rewrite)
+
+Each organization on a deployment connects its OWN Telegram bot — there is no more single,
+deployment-wide `TELEGRAM_BOT_TOKEN`/`TELEGRAM_WEBHOOK_SECRET`. `TELEGRAM_ENABLED` remains a
+global feature flag (an operator sets it once, requires a restart); once it's on, ANY
+organization's own Administrator can connect their own bot from the app itself — no env var
+edits, no restart, no operator involvement per organization.
+
+### 1. An operator enables the feature flag once
+
+```bash
+TELEGRAM_ENABLED="true"
+CREDENTIAL_ENCRYPTION_KEY="$(openssl rand -hex 32)"   # required whenever TELEGRAM_ENABLED,
+                                                        # WHATSAPP_ENABLED, or
+                                                        # ANDROID_GATEWAY_ENABLED is true —
+                                                        # see "Per-organization credential
+                                                        # encryption" below.
+```
+
+Restart the app (`npm run dev` / redeploy) so `registerChannelAdapters()` picks up the
+`TelegramAdapter` registration (see `src/server/channels/index.ts`) and `env.ts` accepts
+`CREDENTIAL_ENCRYPTION_KEY`.
+
+### 2. Each organization creates its own bot with @BotFather
 
 1. Open a chat with [`@BotFather`](https://t.me/BotFather) on Telegram.
 2. Send `/newbot`, choose a name and a unique `@username` (must end in `bot`).
 3. BotFather replies with a bot token that looks like `123456789:AAExampleTokenNotReal`.
-   Put this in `TELEGRAM_BOT_TOKEN`.
 
-### 2. Choose a webhook secret
+### 3. Connect the bot from Settings — no manual `setWebhook` call needed
 
-Generate a random string (e.g. `openssl rand -hex 32`) and set it as
-`TELEGRAM_WEBHOOK_SECRET`. This value is compared against the
-`X-Telegram-Bot-Api-Secret-Token` header Telegram sends on every webhook delivery
-(`TelegramAdapter.validateWebhook`, constant-time comparison) — it must match exactly what
-you register with `setWebhook` in step 4.
+Sign in as that organization's Administrator, open **Settings → Telegram**, paste the bot
+token from step 2 into the form, and click **"Connect bot"**
+(`registerTelegramWebhook` Server Action, `src/server/actions/telegram.ts`). This:
 
-### 3. Set the remaining env vars and enable the adapter
+1. Calls Telegram's `getMe` with the pasted token to validate it and resolve the bot's own
+   numeric id/username (`ChannelAccount.externalAccountId`/`displayName`).
+2. Generates a fresh, random, per-organization webhook secret.
+3. Encrypts `{ botToken, webhookSecret }` (AES-256-GCM — see "Per-organization credential
+   encryption" below) and creates/updates this organization's `ChannelAccount`.
+4. Calls Telegram's `setWebhook` itself, pointing at this organization's OWN webhook path:
+   `${APP_URL}/api/channels/telegram/webhook/{channelAccountId}`, with the generated
+   webhook secret as the `secret_token`.
 
-```bash
-TELEGRAM_ENABLED="true"
-TELEGRAM_BOT_TOKEN="123456789:AAExampleTokenNotReal"
-TELEGRAM_WEBHOOK_SECRET="the-random-secret-from-step-2"
-```
-
-Restart the app (`npm run dev` / redeploy) so `registerChannelAdapters()` picks up the new
-`TelegramAdapter` registration (see `src/server/channels/index.ts`).
+No manual `curl`/`setWebhook` step is needed — unlike the old global-bot-token design, this
+is now a genuinely self-service, in-app flow for every organization, not just the first one
+on the deployment.
 
 ### 4. Local development — exposing your dev server to Telegram
 
@@ -46,7 +102,7 @@ ngrok http 3000
 ```
 
 Copy the printed `https://<random>.ngrok-free.app` URL — that's your tunnel's public base
-URL for step 5 below (append `/api/channels/telegram/webhook`).
+URL.
 
 **cloudflared** (Cloudflare Tunnel, no account required for a quick tunnel)
 
@@ -56,43 +112,40 @@ cloudflared tunnel --url http://localhost:3000
 
 Copy the printed `https://<random>.trycloudflare.com` URL the same way.
 
-Either way, also set `APP_URL` to that tunnel URL for the duration of the session (the
-Settings UI's "webhook URL" helper and the `getTelegramWebhookConfig`/`registerTelegramWebhook`
-Server Actions derive the webhook URL from `APP_URL`).
+Either way, also set `APP_URL` to that tunnel URL for the duration of the session BEFORE
+clicking "Connect bot" (the webhook URL Telegram registers is derived from `APP_URL` at
+connect time — reconnecting after `APP_URL` changes re-registers against the new URL, see
+step 5).
 
-### 5. Register the webhook with Telegram
-
-Two options, both set the exact same thing (a URL + the secret token from step 2):
-
-- **From the app**: sign in as an Administrator, open **Settings → Telegram**, and click
-  **"Register webhook now"**. This calls `setWebhook` on your behalf using
-  `TELEGRAM_BOT_TOKEN`/`TELEGRAM_WEBHOOK_SECRET`/`APP_URL`, and creates the `ChannelAccount`
-  row this org needs (see the "known limitations" note below).
-- **Manually**, via `curl`:
-
-  ```bash
-  curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
-    -H "Content-Type: application/json" \
-    -d "{\"url\": \"${APP_URL}/api/channels/telegram/webhook\", \"secret_token\": \"${TELEGRAM_WEBHOOK_SECRET}\"}"
-  ```
-
-Verify with `https://api.telegram.org/bot<token>/getWebhookInfo` — `url` should match, and
-`last_error_message` should be empty once you've sent the bot a message.
-
-### 6. Production setup
+### 5. Production setup
 
 - Point `APP_URL` at your real custom domain (e.g. `https://app.example.com`) — it must be
   HTTPS; Telegram refuses non-HTTPS webhook URLs.
-- Re-run step 5 ("Register webhook now" or the `curl` command) against the production
-  `APP_URL` — Telegram webhooks are per-bot-token, not per-environment, so switching from a
-  dev tunnel to production means re-registering against the new URL.
-- Rotate `TELEGRAM_WEBHOOK_SECRET` if the dev tunnel's value was ever shared/committed
-  anywhere; re-register after rotating (the old secret stops validating immediately).
+- Each organization re-clicks "Connect bot" (re-pasting the same bot token is fine — this
+  hits the update path, not create, and just re-registers `setWebhook` against the new
+  `APP_URL`) once the app is live at its production URL.
+- If a bot token was ever shared/committed anywhere, rotate it in @BotFather
+  (`/revoke` then `/token`, or `/newbot` for a fresh bot entirely) and reconnect with the
+  new token from Settings.
+
+### Multi-organization isolation
+
+Two different organizations can each connect their own distinct bot — each gets its own
+`ChannelAccount`, its own encrypted credentials, and its own webhook path
+(`/api/channels/telegram/webhook/{channelAccountId}`), so inbound deliveries are routed
+purely by which URL Telegram calls, never by "whichever org was created first" (the old
+single-global-bot-token design's C1 leak — see below). The one remaining restriction is at
+the bot level, not the organization level: `ChannelAccount` has a database-level unique
+constraint on `(channelType, externalAccountId)`, so the SAME bot (the same Telegram bot id)
+can never be connected to two different organizations at once — pasting a bot token another
+org already has connected is rejected with a clear conflict error before any webhook is
+touched.
 
 ### Bot commands
 
 The bot intercepts four commands before any translation/storage happens (never stored as
-ordinary chat messages — see `src/app/api/channels/telegram/webhook/route.ts`):
+ordinary chat messages — see
+`src/app/api/channels/telegram/webhook/[channelAccountId]/route.ts`):
 
 | Command     | Behavior                                                                 |
 | ----------- | ------------------------------------------------------------------------ |
@@ -103,35 +156,25 @@ ordinary chat messages — see `src/app/api/channels/telegram/webhook/route.ts`)
 
 ### Known limitations (documented, not hidden)
 
-- **One global bot token per deployment — actively enforced, not just documented.**
-  `TELEGRAM_BOT_TOKEN`/`TELEGRAM_WEBHOOK_SECRET` are single, deployment-wide env vars (not
-  per-organization credentials), so the webhook route resolves which organization a
-  delivery belongs to via "the sole `ACTIVE` `ChannelAccount` of type TELEGRAM across the
-  whole deployment" (`channelAccountRepository.listAllActiveByChannelType` in
-  `resolveTelegramChannelAccount`), not a true per-org bot-token lookup. An earlier version
-  of this MVP left that as an unenforced assumption — a second organization could silently
-  create its own ACTIVE Telegram `ChannelAccount`, and every inbound webhook would then
-  resolve to whichever org's account was created first, leaking that org's Telegram
-  contacts/conversations/messages into the other org's inbox. **This is now hard-blocked**:
-  `registerTelegramWebhook` (`src/server/actions/telegram.ts`) checks — across ALL
-  organizations, not just the caller's own — whether a different organization already has
-  an ACTIVE Telegram `ChannelAccount` before ever creating a new one, and throws a
-  `ConflictError` ("This deployment's Telegram bot is already connected to another
-  organization. Multi-org Telegram requires per-org bot tokens, not yet supported.") if so
-  — no side effects, no `setWebhook` call is even made. As defense-in-depth,
-  `resolveTelegramChannelAccount` itself also checks this invariant on every webhook
-  delivery: if it ever finds more than one ACTIVE Telegram `ChannelAccount` across
-  organizations (which should be unreachable given the guard above, but could still happen
-  via direct DB access or a future regression), it logs an error and rejects the request
-  (`409`) instead of silently routing the message to an arbitrary organization. Multiple
-  organizations each running their own Telegram bot therefore remains a **post-MVP gap**
-  (this deployment can only ever support ONE organization's Telegram bot at a time) — the
-  real fix is per-org credential storage plus either per-org webhook paths (e.g.
-  `/api/channels/telegram/webhook/[channelAccountId]`) or looking up the bot id via `getMe`
-  per request and matching `ChannelAccount.externalAccountId`. See
-  `src/server/actions/telegram.test.ts` and
-  `src/app/api/channels/telegram/webhook/route.test.ts` for the tests proving both the
-  registration-time block and the webhook-routing-time safety net.
+- **~~One global bot token per deployment~~ — FIXED. Each organization now has genuinely
+  distinct credentials and a genuinely distinct webhook path.** An earlier version of this
+  MVP shared one global `TELEGRAM_BOT_TOKEN`/`TELEGRAM_WEBHOOK_SECRET` across every
+  organization on the deployment, resolving which org an inbound delivery belonged to via
+  "the sole `ACTIVE` `ChannelAccount` of type TELEGRAM across the whole deployment" — a
+  design that could only ever support one organization's Telegram bot at a time, and which
+  an earlier bug (C1) let a second org silently claim anyway, leaking the first org's
+  Telegram traffic into the second org's inbox. That entire class of problem is now
+  structurally impossible: bot credentials are encrypted per-`ChannelAccount`, the webhook
+  URL itself (`/api/channels/telegram/webhook/{channelAccountId}`) names which organization
+  and which credentials a delivery is checked against, and there is no "resolve by scanning
+  for the sole active row" step left to get wrong. The one remaining restriction is
+  DB-enforced at the bot-id level, not the deployment level: the SAME bot (matched by its
+  Telegram bot id, `ChannelAccount.externalAccountId`) can never be connected — active or
+  not — to two different organizations at once (`@@unique([channelType, externalAccountId])`
+  in `prisma/schema.prisma`), which is the real, narrower invariant that actually matters
+  (see "Multi-organization isolation" above). See `src/server/actions/telegram.test.ts` and
+  `src/app/api/channels/telegram/webhook/[channelAccountId]/route.test.ts` for the tests
+  proving both the same-bot-id conflict and genuine cross-org webhook isolation.
 - **No delivery receipts.** Telegram has no polling delivery-status API for regular bot
   messages, and this MVP wires no separate read-receipt webhook — `TelegramAdapter.getDeliveryStatus`
   always returns `null`. A sent message's terminal *tracked* status is `SENT`
@@ -393,22 +436,29 @@ Response `200`:
   this channel's terminal *tracked* status, same precedent as Telegram's `getDeliveryStatus`
   always returning `null`.
 
-## WhatsApp Business Cloud API (Phase 9 — fully implemented, gated behind `WHATSAPP_ENABLED`)
+## WhatsApp Business Cloud API (Phase 9 — fully implemented; per-organization credentials
+since the Builder's multi-tenant rewrite)
 
 The official WhatsApp Business **Cloud API** (Meta's own hosted Graph API product) — never
 an unofficial browser-automation/session-hijacking approach. `WHATSAPP_ENABLED` defaults to
-`false`; with it unset or `false`, **zero** `WHATSAPP_*` env vars are required
-(`src/server/env.ts`'s conditional-requirement logic — see `env.test.ts`), `WhatsAppAdapter`
-is never constructed/registered (`src/server/channels/index.ts`), and both webhook routes
-are inert: `GET /api/channels/whatsapp/webhook` and `POST /api/channels/whatsapp/webhook`
-return a bare `404`, and `GET /api/channels/whatsapp/health` returns
-`{ enabled: false, healthy: false, ... }` with a `200` (never an error) rather than throwing.
+`false`; with it unset or `false`, the adapter is never constructed/registered
+(`src/server/channels/index.ts`) and both webhook routes are inert (`404`), and
+`GET /api/channels/whatsapp/health` returns `{ enabled: false, healthy: false, ... }` with a
+`200` (never an error) rather than throwing.
 
-**Everything below this point is external, human, Meta-side setup.** None of it can be
-performed by this application's code — there is no API this codebase can call on your
-behalf to create a Meta Business account, add the WhatsApp product to an App, or get a
+There is no more single, deployment-wide `WHATSAPP_ACCESS_TOKEN`/`WHATSAPP_PHONE_NUMBER_ID`/
+`WHATSAPP_BUSINESS_ACCOUNT_ID`/`WHATSAPP_VERIFY_TOKEN`/`WHATSAPP_APP_SECRET`. Each
+organization now connects its OWN WhatsApp Business phone number from **Settings →
+WhatsApp Business** — no env var edits, no restart, no operator involvement per
+organization (only the one-time `WHATSAPP_ENABLED`/`CREDENTIAL_ENCRYPTION_KEY` feature-flag
+setup below is an operator's job).
+
+**Everything below this point (steps 1–2) is external, human, Meta-side setup.** None of it
+can be performed by this application's code — there is no API this codebase can call on
+your behalf to create a Meta Business account, add the WhatsApp product to an App, or get a
 production number verified. You (a human, in the Meta dashboards) must do every step; the
-app only needs the resulting credentials pasted into its env vars afterward.
+resulting five credential values are then pasted into the in-app connect form (step 3),
+not into env vars.
 
 ### 1. Create a Meta Business Manager account and App
 
@@ -442,63 +492,84 @@ and verify in the dashboard, and to Meta's own test templates. To send messages 
 None of this is a code change — it is entirely dashboard/paperwork on Meta's side. Budget
 real calendar time for it before committing to a production launch date.
 
-### 3. Obtain the four credential env vars
+### 3. Obtain the five credential values and connect from Settings
 
 From the App dashboard, under WhatsApp → API Setup (or WhatsApp → Configuration once past
-the test-number stage):
+the test-number stage), collect:
 
-- `WHATSAPP_PHONE_NUMBER_ID` — the numeric id of the specific WhatsApp phone number (test or
+- **Phone number id** — the numeric id of the specific WhatsApp phone number (test or
   production) you're sending from. This is what `WhatsAppAdapter` puts in the Graph API URL
-  (`https://graph.facebook.com/v21.0/<WHATSAPP_PHONE_NUMBER_ID>/messages`) and what the
-  webhook route uses to resolve which `ChannelAccount` an inbound delivery belongs to (see
-  "Known limitations" below).
-- `WHATSAPP_BUSINESS_ACCOUNT_ID` — the WABA id itself (one level up from the phone number;
-  a WABA can own multiple phone numbers). Not currently used by any Graph API call this
-  adapter makes, but recorded per §7's required-credentials list for completeness and future
-  use (e.g. querying/managing message templates via the WABA-level endpoints).
-- `WHATSAPP_ACCESS_TOKEN` — a token authorizing calls against the above. For development,
-  the dashboard's "Temporary access token" (valid ~24h) is enough to exercise everything in
-  this guide; for anything longer-lived, generate a **System User** access token (Business
+  (`https://graph.facebook.com/v21.0/<phoneNumberId>/messages`) and, once connected, becomes
+  `ChannelAccount.externalAccountId` — the value the DB-level uniqueness guarantee (see
+  "Multi-organization isolation" below) keys on.
+- **Business account id** — the WABA id itself (one level up from the phone number; a WABA
+  can own multiple phone numbers). Not currently used by any Graph API call this adapter
+  makes, but recorded for completeness and future use (e.g. querying/managing message
+  templates via the WABA-level endpoints).
+- **Access token** — a token authorizing calls against the above. For development, the
+  dashboard's "Temporary access token" (valid ~24h) is enough to exercise everything in this
+  guide; for anything longer-lived, generate a **System User** access token (Business
   Settings → System Users) scoped to the `whatsapp_business_messaging`/
   `whatsapp_business_management` permissions — System User tokens don't expire on a fixed
   clock the way a personal access token does, and aren't tied to a human's Meta login
   session.
-- `WHATSAPP_APP_SECRET` — the App's secret, found under App Settings → Basic. This is the
-  HMAC key `WhatsAppAdapter.validateWebhook` uses to verify `X-Hub-Signature-256` on every
-  inbound webhook delivery — treat it exactly like the Telegram bot token: never commit it,
-  rotate it if it leaks (rotating immediately invalidates every previously-computed
-  signature, so do this in a maintenance window, not silently).
+- **App secret** — the App's secret, found under App Settings → Basic. This becomes the
+  HMAC key `verifyWhatsAppSignature` uses to verify `X-Hub-Signature-256` on every inbound
+  webhook delivery to THIS organization's own webhook path.
+- **Verify token** — **self-chosen** by you (like Telegram's per-org webhook secret,
+  generated automatically) — pick a random string (e.g. `openssl rand -hex 32`); you'll
+  enter the exact same value in Meta's dashboard in step 4.
 
-### 4. Choose `WHATSAPP_VERIFY_TOKEN` and register the webhook
+Sign in as this organization's Administrator, open **Settings → WhatsApp Business**, and
+paste all five values into the connect form. This calls `connectWhatsAppAccount`
+(`src/server/actions/whatsapp.ts`), which:
 
-`WHATSAPP_VERIFY_TOKEN` is **self-chosen** (like `TELEGRAM_WEBHOOK_SECRET`) — generate a
-random string (`openssl rand -hex 32`) and set it as an env var. Then, in the App dashboard
-under WhatsApp → Configuration → Webhook:
+1. Runs a lightweight Graph API health check (fetches this phone number's own info) with the
+   pasted access token/phone number id BEFORE saving anything — a typo'd credential is
+   rejected immediately with a clear error, never silently stored.
+2. Encrypts the five-field credential shape (AES-256-GCM — see "Per-organization credential
+   encryption" below) and creates/updates this organization's `ChannelAccount`.
+3. Returns this organization's own webhook URL —
+   `${APP_URL}/api/channels/whatsapp/webhook/{channelAccountId}` — to register in step 4.
 
-1. Set the **Callback URL** to `<APP_URL>/api/channels/whatsapp/webhook`.
-2. Set the **Verify Token** field to the exact same value as `WHATSAPP_VERIFY_TOKEN`.
-3. Click **Verify and Save** — Meta immediately issues a `GET` request to your callback URL
-   with `?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`; `WhatsAppAdapter`'s
-   route (`src/app/api/channels/whatsapp/webhook/route.ts`'s `GET` handler) must be publicly
-   reachable over HTTPS at that moment (same tunneling note as Telegram's setup — see that
-   section above for `ngrok`/`cloudflared` instructions if developing locally) and must
-   return the raw `hub.challenge` value as plain text with `200`, which it does once the
-   verify token matches.
+### 4. Register the webhook in Meta's App Dashboard
+
+Unlike Telegram's fully-automatic "Connect bot" flow, registering the webhook URL with Meta
+remains a manual, dashboard-only step (Meta's webhook subscription isn't a plain API call
+this app can make on your behalf). In the App dashboard under WhatsApp → Configuration →
+Webhook:
+
+1. Set the **Callback URL** to the per-organization URL the connect form showed you:
+   `<APP_URL>/api/channels/whatsapp/webhook/<channelAccountId>`.
+2. Set the **Verify Token** field to the exact same value you chose and entered in step 3.
+3. Click **Verify and Save** — Meta immediately issues a `GET` request to that callback URL
+   with `?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`; the per-account route
+   (`src/app/api/channels/whatsapp/webhook/[channelAccountId]/route.ts`'s `GET` handler)
+   must be publicly reachable over HTTPS at that moment (same tunneling note as Telegram's
+   setup — see that section above for `ngrok`/`cloudflared` instructions if developing
+   locally), and validates your verify token against THIS organization's own stored one
+   before echoing back the raw `hub.challenge` value as plain text with `200`.
 4. Subscribe to the **`messages`** webhook field (this is what delivers both inbound
    messages and delivery-status callbacks — Meta doesn't separate them into different
    fields).
 
-Set `WHATSAPP_ENABLED="true"` and restart the app so `registerChannelAdapters()` picks up
-`WhatsAppAdapter` (`src/server/channels/index.ts`) — until you do, the webhook route stays
-`404` even with every other var correctly set (by design: enabling the adapter is a single,
-explicit flag flip, not implied by "some WhatsApp env vars happen to be present").
+An operator must still set `WHATSAPP_ENABLED="true"` (and `CREDENTIAL_ENCRYPTION_KEY`) once
+for the whole deployment and restart the app so `registerChannelAdapters()` picks up
+`WhatsAppAdapter` (`src/server/channels/index.ts`) — until then, the connect form itself
+refuses to run and both webhook routes stay `404` regardless of what's pasted into them (by
+design: enabling the adapter is a single, explicit, deployment-wide flag flip).
 
-You'll also need at least one `ChannelAccount` row of type `WHATSAPP` with
-`externalAccountId` set to your `WHATSAPP_PHONE_NUMBER_ID` and `status: ACTIVE` for the
-webhook route to resolve inbound deliveries against (see "Known limitations" below — there
-is currently no Settings UI/Server Action to create this row, unlike Telegram's "Register
-webhook now" button; create it directly via Prisma/`channelAccountRepository.create` for
-now).
+### Multi-organization isolation
+
+Two different organizations can each connect their own distinct WhatsApp Business phone
+number — each gets its own `ChannelAccount`, its own encrypted credentials, and its own
+webhook path (`/api/channels/whatsapp/webhook/{channelAccountId}`), so both the GET
+verify-handshake and POST inbound/status deliveries are checked purely against the specific
+account the URL names — there is no more "peek inside the body for `phone_number_id` before
+knowing which secret to verify with" step (see "Known limitations" below for the design this
+replaced). The DB-level `@@unique([channelType, externalAccountId])` constraint means the
+SAME phone number can never be connected — active or not — to two different organizations
+at once.
 
 ### 5. Message templates (required to *initiate* conversations)
 
@@ -538,19 +609,15 @@ API for this either; the webhook is the only source, same precedent as Telegram/
 
 ### Known limitations (documented, not hidden)
 
-- **One global WhatsApp phone number per deployment, resolved from `phone_number_id` in the
-  payload.** Unlike Telegram's "just grab the first ACTIVE ChannelAccount of this type"
-  shortcut, the WhatsApp webhook route resolves the correct `ChannelAccount` per webhook
-  `value` block via `channelAccountRepository.findActiveByChannelTypeAndExternalAccountId`
-  keyed on `phone_number_id` — so multiple WhatsApp Business phone numbers *could* each map
-  to their own `ChannelAccount` in principle, but there is currently no UI/Server Action to
-  create/manage those rows (see below), so in practice this MVP still only exercises one.
-- **No "connect WhatsApp" Settings UI/Server Action.** Unlike Telegram's "Register webhook
-  now" button (which calls `setWebhook` and creates the `ChannelAccount` for you),
-  registering the webhook with Meta is entirely dashboard-driven (step 4 above) and there is
-  currently no in-app action to create the corresponding `ChannelAccount` row afterward — a
-  natural, low-risk follow-up (the Settings section, `whatsapp-section.tsx`, only surfaces
-  health status today, matching the Phase 9 task brief's "keep this small").
+- **~~One global WhatsApp phone number per deployment~~ — FIXED.** An earlier version of
+  this MVP resolved every inbound delivery by peeking inside the webhook body for
+  `phone_number_id` (via `channelAccountRepository.findActiveByChannelTypeAndExternalAccountId`)
+  BEFORE knowing which organization's `appSecret` to verify the signature with — workable
+  only because `WHATSAPP_APP_SECRET` was one global env var, and there was no in-app way to
+  connect more than one organization's number anyway. Both limitations are gone: the
+  per-account webhook URL now identifies the account (and its own secret) up front, and any
+  organization can connect its own number from Settings (see "Multi-organization isolation"
+  above).
 - **No template-selection/24h-window logic wired into the outbound lifecycle.**
   `sendTemplateMessage` exists and is tested in isolation (mocked `fetch`), but nothing in
   `src/server/messaging/outboundService.ts` yet decides "is this contact's 24h window open,

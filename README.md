@@ -202,9 +202,11 @@ docker-compose.yml         # Local Postgres 16
 
 ## Channel adapters
 
-**Telegram is fully implemented (Phase 6)** — see
+**Telegram is fully implemented, per-organization (Phase 6, rewritten for multi-tenant
+credentials)** — each organization connects its OWN bot (from Settings, in-app) rather than
+this deployment sharing one global bot token; see
 [`docs/channel-adapters.md`](./docs/channel-adapters.md) for bot creation via @BotFather,
-local-dev tunneling (ngrok/cloudflared), webhook registration, and production setup.
+local-dev tunneling (ngrok/cloudflared), and the in-app connect flow.
 
 **Android SMS gateway is fully implemented, server side (Phase 8)** — a physical Android
 device (its own SIM, no cloud SMS vendor) polls the server for outbound sends and pushes
@@ -215,16 +217,25 @@ companion Android app's build specification (permissions, foreground service, ba
 optimization, retry behavior, carrier limitations, privacy disclosure). No Kotlin app ships
 in this repo yet — those two documents are the complete spec for building one.
 
-**WhatsApp Business Cloud API is fully implemented, gated behind `WHATSAPP_ENABLED`
-(Phase 9)** — the official Meta Graph API (never unofficial browser
+**WhatsApp Business Cloud API is fully implemented, per-organization, gated behind
+`WHATSAPP_ENABLED`** — the official Meta Graph API (never unofficial browser
 automation/session-hijacking), with real `X-Hub-Signature-256` webhook signature
-validation and the GET-verify subscription handshake. With `WHATSAPP_ENABLED` unset/false
-(the default), zero `WHATSAPP_*` env vars are required and both webhook routes are inert
-(`404`); see the "WhatsApp Business Cloud API" section of
-[`docs/channel-adapters.md`](./docs/channel-adapters.md) for the full, entirely-external,
-Meta-side setup checklist (Business Manager account, App Review/Business Verification,
-obtaining credentials, registering the webhook, and message-template approval) — none of
-which this codebase can perform on your behalf.
+validation (checked against each organization's own app secret) and the GET-verify
+subscription handshake. With `WHATSAPP_ENABLED` unset/false (the default), the adapter/
+routes are inert (`404`); with it on, each organization pastes its own Cloud API
+credentials from Settings (validated against the Graph API before saving) rather than this
+deployment sharing one global set of `WHATSAPP_*` env vars. See the "WhatsApp Business
+Cloud API" section of [`docs/channel-adapters.md`](./docs/channel-adapters.md) for the full,
+entirely-external, Meta-side setup checklist (Business Manager account, App
+Review/Business Verification, obtaining credentials, registering the per-organization
+webhook URL, and message-template approval) — none of which this codebase can perform on
+your behalf.
+
+**Channel credentials are encrypted at rest, per organization** — see
+[`docs/channel-adapters.md`](./docs/channel-adapters.md)'s "Per-organization credential
+encryption" section and `src/server/crypto/credentialEncryption.ts` for the AES-256-GCM
+design (`CREDENTIAL_ENCRYPTION_KEY`, required whenever any of Telegram/WhatsApp/Android
+gateway is enabled).
 
 ## Scheduling the retry worker in production
 
@@ -354,11 +365,21 @@ Telegram/WhatsApp, is the base URL those channels' webhooks need to reach.
 
 ### 6. After first deploy
 
-- Register the Telegram webhook (if `TELEGRAM_ENABLED=true`) per
-  `docs/channel-adapters.md`'s Telegram section, pointing at `${APP_URL}/api/channels/telegram/webhook`.
-- Configure the WhatsApp webhook (if `WHATSAPP_ENABLED=true`) in Meta's App Dashboard,
-  pointing at `${APP_URL}/api/channels/whatsapp/webhook`, using `WHATSAPP_VERIFY_TOKEN` for
-  the GET-verify handshake.
+- Set `CREDENTIAL_ENCRYPTION_KEY` (required whenever `TELEGRAM_ENABLED`, `WHATSAPP_ENABLED`,
+  or `ANDROID_GATEWAY_ENABLED` is true — generate one with `openssl rand -hex 32`) BEFORE
+  the first organization connects any channel; it encrypts every organization's channel
+  credentials at rest (see `docs/channel-adapters.md`'s "Per-organization credential
+  encryption" section).
+- If `TELEGRAM_ENABLED=true`: each organization's own Administrator connects their own bot
+  from **Settings → Telegram** (paste the bot token from @BotFather — the app validates it,
+  generates a per-organization webhook secret, and registers the webhook with Telegram
+  automatically at `${APP_URL}/api/channels/telegram/webhook/{channelAccountId}`). See
+  `docs/channel-adapters.md`'s Telegram section.
+- If `WHATSAPP_ENABLED=true`: each organization's own Administrator connects their own
+  WhatsApp Cloud API credentials from **Settings → WhatsApp Business** (validated against
+  the Graph API before saving), then registers the shown webhook URL
+  (`${APP_URL}/api/channels/whatsapp/webhook/{channelAccountId}`) and their own
+  `verifyToken` in Meta's App Dashboard.
 - Point an external scheduler at `${APP_URL}/api/internal/retry-worker` per "Scheduling the
   retry worker in production" above — Railway has no built-in cron primitive for a web
   service, so use an external scheduler (a separate Railway **Cron Job** template hitting
