@@ -5,14 +5,19 @@ inbound and outbound messages across multiple channels (Telegram, Android SMS ga
 WhatsApp — plus placeholders for Messenger/Instagram/Email), so a team can converse with
 contacts in their own language without anyone doing the translation by hand.
 
-This repository is being built in phases against
+This repository was built in phases against
 [`docs/implementation-plan.md`](./docs/implementation-plan.md), the governing architecture
-document. **This README reflects the MVP through Phase 9** — Telegram and Android SMS are
-fully implemented, WhatsApp Business Cloud API is implemented gated behind
-`WHATSAPP_ENABLED`, the full shared-inbox UI (Phase 7) is in place, and a subsequent
-security/completeness review pass (see `docs/review-report.md`) added security headers,
-broader rate limiting, user management, an internal retry-worker endpoint, and Android
-device-management UI on top of that.
+document. **This README reflects the current, post-review state of the MVP** — all of the
+following are fully built and covered by the test suite: Telegram (fully implemented),
+Android SMS gateway (fully implemented, server side), WhatsApp Business Cloud API
+(fully implemented, gated behind `WHATSAPP_ENABLED`), the full shared-inbox UI (contacts,
+conversations, message threads with original/translated toggle, review-before-send,
+internal notes, glossary, team/user management, settings), security headers, rate limiting
+on every public/webhook-adjacent endpoint, an internal retry-worker endpoint for automatic
+send retries, and Android device-management UI (register/list/revoke). See
+`docs/review-report.md` and `docs/test-report.md` for the full independent review/test
+history (every finding's status is tracked there). The application has also been deployed
+to Railway — see "Deployment (Railway)" below for how to reproduce that.
 
 ## Product overview
 
@@ -152,31 +157,46 @@ npx prisma validate
 All three must pass with zero errors. A minimal GitHub Actions workflow running the same
 checks (plus `npm ci`) lives at `.github/workflows/ci.yml`.
 
-## Project structure (Phase 3)
+## Project structure
 
 ```
 prisma/
-  schema.prisma        # Data model — see docs/implementation-plan.md §4 for design notes
-  seed.ts               # Dev seed data
-  migrations/           # Committed migration history
+  schema.prisma          # Data model — see docs/implementation-plan.md §4 for design notes
+  seed.ts                 # Dev seed data
+  migrations/             # Committed migration history
 src/
   app/
-    (auth)/             # Sign-in route group (public)
-    (app)/               # Authenticated shell: role-aware nav + placeholder pages
+    (auth)/               # Sign-in route group (public)
+    (app)/                 # Authenticated shell: nav, translation-disclosure banner (M2),
+                            #   contacts, teams, settings (channel integrations, users, glossary)
+      inbox/[conversationId]/  # Message thread, composer, high-risk banner, retry actions
     api/
-      auth/[...nextauth]/  # Auth.js route handler
-      health/               # GET /api/health — liveness/readiness
+      auth/[...nextauth]/    # Auth.js route handler
+      channels/telegram/     # Telegram webhook route (+ /language self-service handling)
+      channels/whatsapp/      # WhatsApp webhook route (GET verify handshake + POST inbound)
+      gateways/                # Android SMS gateway: register/heartbeat/inbound/messages/etc.
+      internal/retry-worker/    # Shared-secret-gated cron entrypoint for automatic retries
+      health/                    # GET /api/health — liveness/readiness
   server/
-    env.ts               # Zod-validated process env (fails fast, see §6.7)
-    logger.ts            # pino structured logging
-    errors.ts             # AppError hierarchy + handleRouteError/toSafeActionError
-    auth.ts               # Auth.js (NextAuth v5) config: Prisma adapter, Credentials + Email
-    db.ts                  # Prisma client singleton
-    roles.ts               # Role ordering + requireRole guard
-    repositories/           # Org-scoped repository pattern (userRepository, organizationRepository)
+    env.ts                 # Zod-validated process env (fails fast, see §6.7)
+    logger.ts               # pino structured logging
+    errors.ts                # AppError hierarchy + handleRouteError/toSafeActionError
+    auth.ts                  # Auth.js (NextAuth v5) config: Prisma adapter, Credentials + Email
+    authTokenRefresh.ts        # Per-request JWT re-check (deactivation/role-change enforcement)
+    db.ts                       # Prisma client singleton
+    roles.ts                     # Role ordering + requireRole guard
+    rateLimit.ts                  # Shared in-process rate limiter (webhooks, gateways, auth)
+    actions/                       # Server Actions (contacts, conversations, messages, teams,
+                                    #   users, telegram, whatsapp, android, glossary, settings)
+    channels/                       # Channel adapter interface + Telegram/WhatsApp/Android impls
+    messaging/                       # Inbound/outbound lifecycles, retry/backoff, idempotency
+    translation/                      # Translation engine + provider implementations
+    repositories/                      # Org-scoped repository pattern (one file per model)
+  middleware.ts            # Security headers (HSTS, CSP, X-Frame-Options, etc.)
   lib/
-    schemas/               # Client-safe Zod schemas shared by forms
-docker-compose.yml        # Local Postgres 16
+    schemas/                # Client-safe Zod schemas shared by forms
+android-gateway/           # Spec (no code shipped) for the companion Android SMS gateway app
+docker-compose.yml         # Local Postgres 16
 .env.example                # All supported env vars, with comments
 ```
 
@@ -255,6 +275,96 @@ be retried when a human clicks "Retry" in the inbox UI.
 
 The route processes every organization's due `FAILED` messages in one pass and returns
 `{ ok: true, attempted, succeeded, failed }`.
+
+## Deployment (Railway)
+
+This app has been deployed to [Railway](https://railway.app) — a Postgres service plus a
+web service built from this GitHub repo, in one project.
+
+### 1. Postgres service
+
+Add a Postgres database to the Railway project (Railway's own "Database → PostgreSQL"
+template). Railway exposes its connection string as `DATABASE_URL` on that service; the web
+service below needs to reference it (Railway's variable-reference syntax, e.g.
+`${{Postgres.DATABASE_URL}}`, lets one service read another's variables without copy-pasting
+a secret between them).
+
+### 2. Web service (from GitHub)
+
+Create a second service in the same project, connected to this repository (Railway
+auto-detects the Next.js build via Nixpacks — no `Dockerfile` needed). Set:
+
+- **Build command**: default (Nixpacks runs `npm install && npm run build`).
+- **Start command**: `npm run start` (or leave default — `package.json#scripts.start` runs
+  `next start`).
+- **Pre-deploy command** (`preDeployCommand` in Railway's service settings): see below.
+
+### 3. Required environment variables
+
+Mirror `.env.example` (see that file for the full, commented list). At minimum:
+
+- `DATABASE_URL` / `DIRECT_URL` — both set to the Postgres service's connection string
+  (Railway variable reference, e.g. `${{Postgres.DATABASE_URL}}` for both, since there's no
+  separate pooler in this deployment shape).
+- `AUTH_SECRET` — `openssl rand -base64 32`.
+- `APP_URL` — the web service's public Railway domain (see step 5), e.g.
+  `https://autotranslator-production.up.railway.app`.
+- `LOG_LEVEL` — `info` (or your preference).
+- `TRANSLATION_PROVIDER` + `OPENAI_API_KEY` if you want real translation (otherwise leave
+  `TRANSLATION_PROVIDER=noop`, which needs no key).
+- Whichever of `TELEGRAM_ENABLED`/`ANDROID_GATEWAY_ENABLED`/`WHATSAPP_ENABLED` (plus their
+  conditional `*_TOKEN`/`*_SECRET` vars) you're actually turning on for this deployment.
+- `INTERNAL_WORKER_SECRET` — required for the retry-worker cron pattern below to be
+  reachable at all (the route fails closed with `503` if unset).
+
+### 4. The `preDeployCommand` pattern
+
+Railway's **pre-deploy command** runs once per deploy, before the new instance receives
+traffic — the right place for `prisma migrate deploy`. This project's `preDeployCommand`
+is:
+
+```
+npx prisma migrate deploy && npx prisma db seed
+```
+
+**Known simplification — flagging this deliberately, not silently:** `prisma db seed` runs
+`prisma/seed.ts`, which is dev/demo seed data (a fixed "Acme Demo Co" organization with
+seeded users at a shared known password — see "Seed data" above). Including it in
+`preDeployCommand` means **every deploy re-seeds**, not just the first one. That's fine (and
+convenient) for a demo/staging environment, but it is not what a real production setup
+should do long-term:
+
+- After the first successful deploy, remove `&& npx prisma db seed` from
+  `preDeployCommand`, leaving just `npx prisma migrate deploy` — migrations should keep
+  running on every deploy, seeding should not.
+- If you need one-off production data (an initial Owner account, say), run
+  `npx prisma db seed` manually once via `railway run npx prisma db seed`, or write a
+  separate, idempotent production-bootstrap script instead of reusing the demo seed.
+
+This is called out here explicitly so it isn't mistaken for the intended long-term
+production configuration.
+
+### 5. Generating a public domain
+
+Railway's web service settings → **Networking** → **Generate Domain** issues a free
+`*.up.railway.app` HTTPS domain for the service (or attach a custom domain there instead).
+Whichever you use, set `APP_URL` (step 3) to that exact URL — it's used for absolute links
+(magic-link sign-in emails, webhook-registration instructions) and, if you're running
+Telegram/WhatsApp, is the base URL those channels' webhooks need to reach.
+
+### 6. After first deploy
+
+- Register the Telegram webhook (if `TELEGRAM_ENABLED=true`) per
+  `docs/channel-adapters.md`'s Telegram section, pointing at `${APP_URL}/api/channels/telegram/webhook`.
+- Configure the WhatsApp webhook (if `WHATSAPP_ENABLED=true`) in Meta's App Dashboard,
+  pointing at `${APP_URL}/api/channels/whatsapp/webhook`, using `WHATSAPP_VERIFY_TOKEN` for
+  the GET-verify handshake.
+- Point an external scheduler at `${APP_URL}/api/internal/retry-worker` per "Scheduling the
+  retry worker in production" above — Railway has no built-in cron primitive for a web
+  service, so use an external scheduler (a separate Railway **Cron Job** template hitting
+  the URL with `curl`, or any third-party uptime/cron service) rather than `node-cron`
+  in-process (Railway can scale a web service to multiple instances, which would fire the
+  in-process cron once per instance).
 
 ## Multi-tenancy, security, and architecture notes
 
