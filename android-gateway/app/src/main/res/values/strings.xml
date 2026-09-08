@@ -1,0 +1,40 @@
+<resources>
+    <string name="app_name">AutoTranslator Gateway</string>
+
+    <string name="notification_channel_name">SMS gateway status</string>
+    <string name="notification_channel_description">Shows when this device is relaying SMS for AutoTranslator.</string>
+    <string name="notification_title">AutoTranslator gateway is running</string>
+    <string name="notification_text_format">Relaying SMS for %1$s</string>
+    <string name="notification_text_unconfigured">Waiting for setup</string>
+
+    <string name="setup_title">Connect this device</string>
+    <string name="setup_intro">An Administrator registers this device from the AutoTranslator dashboard (Settings → Channel integrations → Android SMS gateway) and is shown a one-time device token. Paste that token below — this app never registers itself.</string>
+    <string name="setup_base_url_label">Server base URL</string>
+    <string name="setup_base_url_placeholder">https://your-app.up.railway.app</string>
+    <string name="setup_device_token_label">Device token</string>
+    <string name="setup_device_token_placeholder">deviceId.hexsignature</string>
+    <string name="setup_consent_text">By continuing, you agree that text messages sent to and from this phone will be relayed through your organization\'s AutoTranslator inbox for translation and staff visibility.</string>
+    <string name="setup_save_button">Save and continue</string>
+
+    <string name="permission_rationale_title">Permissions this app needs</string>
+    <string name="permission_rationale_body">This gateway sends and receives SMS on your organization\'s behalf, so Android requires explicit permission for each of the following:\n\n• Send SMS — to deliver outbound replies\n• Receive SMS — to relay inbound messages\n• Phone state — to pick the correct SIM on dual-SIM phones and detect signal loss\n• Notifications — required to show the persistent \"gateway running\" notice</string>
+    <string name="permission_grant_button">Grant permissions</string>
+
+    <string name="status_title">Gateway status</string>
+    <string name="status_registered">Registered</string>
+    <string name="status_revoked">Disconnected — this device has been revoked. Contact your administrator to re-register it.</string>
+    <string name="status_last_heartbeat_label">Last successful heartbeat</string>
+    <string name="status_service_running">Service running</string>
+    <string name="status_service_stopped">Service stopped</string>
+    <string name="status_test_connection_button">Test connection</string>
+    <string name="status_start_button">Start gateway</string>
+    <string name="status_stop_button">Stop gateway</string>
+    <string name="status_replace_token_button">Replace device / token</string>
+    <string name="status_battery_button">Battery optimization setup</string>
+    <string name="status_test_result_ok">Connection OK</string>
+    <string name="status_test_result_fail">Connection failed: %1$s</string>
+
+    <string name="battery_title">Battery optimization</string>
+    <string name="battery_body">This device needs to stay reachable at all times to relay SMS reliably. Manufacturer battery savers (Samsung Device Care, Xiaomi MIUI battery saver, Huawei Protected Apps, OnePlus Battery Optimization, etc.) can pause this app even after granting the exemption below — check your phone manufacturer\'s own battery settings and allow this app to run unrestricted / without restrictions.</string>
+    <string name="battery_request_button">Request battery optimization exemption</string>
+</resources>

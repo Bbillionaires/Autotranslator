@@ -1,0 +1,16 @@
+<!-- android:allowBackup="false" already disables both cloud backup and device-to-device
+     transfer by default; this file makes that explicit per Android 12+'s replacement
+     mechanism (the device token this app stores must never end up in a backup/restore or
+     device-transfer image on ANY Android version — see GatewayConfigStore's doc comment). -->
+<data-extraction-rules>
+    <cloud-backup disableIfNoEncryptionCapability="false">
+        <exclude domain="sharedpref" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+    </device-transfer>
+</data-extraction-rules>

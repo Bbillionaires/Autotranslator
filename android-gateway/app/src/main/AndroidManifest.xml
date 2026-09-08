@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Talking to the AutoTranslator API at all, and detecting connectivity for the
+         device-side retry logic (README "Required Android permissions"). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Outbound SMS relay (SmsManager) and the inbound BroadcastReceiver. -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+
+    <!-- SEND_SMS/RECEIVE_SMS otherwise imply telephony hardware is mandatory, which would
+         block installs on large-screen/ChromeOS devices with no SIM at all — this app's core
+         purpose genuinely needs telephony, but declaring it explicitly (required="false")
+         keeps the Play Store listing installable there too, matching Android's own guidance
+         for this exact permission combination. -->
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+
+    <!-- Dual-SIM subscription id disambiguation and signal/service-state detection for
+         NO_SIGNAL failure reporting. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+
+    <!-- The persistent poll/heartbeat loop runs as a foreground service. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- A foreground service's persistent notification requires this at runtime on API 33+. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Restart the gateway service automatically after a device reboot — this app is meant
+         to run unattended on a dedicated device (README "Background service requirements"). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- README "Battery-optimization considerations": request exemption from stock Android's
+         Doze/App Standby power management, behind an explanation screen (Settings screen). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:name=".GatewayApplication"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/full_backup_content"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AndroidGateway">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.AndroidGateway">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- The persistent poll/heartbeat/send loop. foregroundServiceType="dataSync" is the
+             closest fit for "syncing messages with a remote server" per Android 14's
+             foreground-service-type enforcement (README "Background service requirements").
+             SEND_SMS itself does not require its own foreground-service type as of API 34,
+             but re-check this against the Android version actually targeted at build time —
+             this has changed across releases and may change again. -->
+        <service
+            android:name=".service.GatewayForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Inbound SMS. Manifest-declared (not dynamically registered) so it fires even when
+             the app's UI has never been opened this boot, as long as the gateway is
+             configured. android:exported="true" is required for the system to deliver this
+             broadcast; Android itself restricts SMS_RECEIVED delivery to apps holding
+             RECEIVE_SMS, so this is not an arbitrary public entry point. -->
+        <receiver
+            android:name=".receiver.SmsReceivedReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="500">
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Restart the foreground service after a reboot, per README's "Background service
+             requirements" — a gateway phone is a dedicated, unattended device. -->
+        <receiver
+            android:name=".receiver.BootCompletedReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>

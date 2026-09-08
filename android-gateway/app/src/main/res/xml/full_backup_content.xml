@@ -1,0 +1,8 @@
+<!-- Pre-Android-12 counterpart to data_extraction_rules.xml (android:allowBackup="false"
+     already disables backups entirely on every version, but android:fullBackupContent is the
+     API 23-30 mechanism lint expects to see referenced explicitly alongside it). -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="file" path="." />
+    <exclude domain="database" path="." />
+</full-backup-content>

@@ -1,0 +1,6 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- A Compose app still needs a base platform theme for the Activity window itself
+         (splash/status-bar chrome before Compose takes over); all actual UI theming happens
+         in ui/theme/Theme.kt via MaterialTheme. -->
+    <style name="Theme.AndroidGateway" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

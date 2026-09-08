@@ -1,0 +1,18 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- A simple speech-bubble glyph — stands in for a real app icon. Replace with a proper
+         designed icon (adaptive icon set generated via Android Studio's Image Asset tool)
+         before shipping to the Play Store. -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,32 H78 A10,10 0 0 1 88,42 V70 A10,10 0 0 1 78,80 H52 L38,92 V80 H30 A10,10 0 0 1 20,70 V42 A10,10 0 0 1 30,32 Z" />
+    <path
+        android:fillColor="#1B4332"
+        android:pathData="M36,48 H72 V54 H36 Z" />
+    <path
+        android:fillColor="#1B4332"
+        android:pathData="M36,60 H60 V66 H36 Z" />
+</vector>

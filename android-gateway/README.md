@@ -1,17 +1,14 @@
-# Android SMS Gateway — companion app build specification
+# Android SMS Gateway — companion app
 
-This directory is the home for the Android companion app that turns a physical Android
-phone (with its own SIM) into a "channel" for AutoTranslator's Shared Inbox — no cloud SMS
-vendor (no Twilio/Telnyx/Vonage) is involved anywhere in this path. **This document is the
-detailed client-side build specification** referenced in the product brief ("if it is
-outside the current project scope, implement the complete backend contract and create a
-separate detailed build specification for the Android client") — the backend contract itself
-lives in [`../docs/channel-adapters.md`](../docs/channel-adapters.md)'s "Android SMS gateway"
-section.
-
-No production Kotlin app ships in this repo (see "What's actually in this directory" below)
-— this README plus the API contract doc together constitute the complete spec a mobile
-engineer needs to build one.
+This directory holds the Android companion app that turns a physical Android phone (with its
+own SIM) into a "channel" for AutoTranslator's Shared Inbox — no cloud SMS vendor (no
+Twilio/Telnyx/Vonage) is involved anywhere in this path. **This document is still the
+detailed client-side build specification** referenced in the product brief ("if it is outside
+the current project scope, implement the complete backend contract and create a separate
+detailed build specification for the Android client") — the backend contract itself lives in
+[`../docs/channel-adapters.md`](../docs/channel-adapters.md)'s "Android SMS gateway" section —
+but a real Kotlin app implementing this spec now also lives under `app/`; see "What's
+actually in this directory" below for what was built and how to build/run it.
 
 ## What the app has to do, end to end
 
@@ -233,16 +230,83 @@ inherently sensitive, and both Google Play policy and basic user trust require:
 
 ## What's actually in this directory
 
-This backend phase (Phase 8) delivered the complete server-side API contract and this build
-specification; **no Kotlin app was built** in this pass — the effort went entirely into a
-fully-tested backend (see the test files under `src/server/gateways/`,
-`src/server/channels/androidSms/`, and `src/app/api/gateways/**` in the main repo) plus this
-document and the API contract in `../docs/channel-adapters.md`, per the product brief's
-explicit allowance: "If it is outside the current project scope, implement the complete
-backend contract and create a separate detailed build specification for the Android client."
-A minimal Kotlin skeleton (a foreground service + one `SmsManager` call + a simple HTTP
-client hitting the six endpoints above) was called out as an explicit bonus/optional
-deliverable, not a requirement, and was intentionally not attempted here so as not to trade
-backend test coverage/robustness for a partial, unverifiable Kotlin stub. A future pass
-implementing the real app should treat this README + the API contract doc as the complete
-spec to build against.
+The Phase 8 backend pass delivered the complete server-side API contract and this build
+specification with no Kotlin app. **A later pass built the real client** under `app/` — a
+minimal-but-functional Kotlin/Jetpack Compose Android app implementing everything above: the
+setup/status screens, the foreground service with its heartbeat + poll/send loops, the
+`SmsManager` send path (multipart, sent-intent result tracking, dual-SIM support), the
+manifest-declared `SMS_RECEIVED` receiver, the boot receiver, on-device retry queues for
+inbound pushes and acknowledge/fail calls, and Keystore-backed encrypted token storage. See
+"Building and running the app" below for how to open and build it.
+
+### Building and running the app
+
+1. **Open the project.** Launch Android Studio (Koala/2024.1 or newer) → Open →
+   select the `android-gateway/` directory (not the repo root — this is a separate Gradle
+   project from the Next.js app, on purpose, so the two build systems never interfere with
+   each other). Studio will run its own first-sync Gradle download automatically.
+2. **SDK requirements**: `compileSdk`/`targetSdk` 34, `minSdk` 26 (Android 8.0 — the first
+   version with the background-service execution limits this app's foreground-service design
+   exists to satisfy). Android Studio will prompt to install platform 34 + build-tools 34.0.0
+   if you don't already have them.
+3. **Point it at a deployed server.** There is no config file to edit — the app has no
+   hardcoded server URL or token anywhere in source (by design, see "Working rules" in the
+   brief this was built against). Install the app on a device or emulator, open it, and on
+   the setup screen enter:
+   - **Server base URL** — e.g. your Railway deployment's URL (`https://your-app.up.railway.app`).
+   - **Device token** — from an Administrator's **Settings → Channel integrations → Android
+     SMS gateway → Register device** action in the AutoTranslator web dashboard (this calls
+     `POST /api/gateways/register` server-side and shows the token exactly once — see
+     "Register a device" above). This app never calls `/register` itself.
+4. **Grant permissions** on the same setup screen (`SEND_SMS`, `RECEIVE_SMS`,
+   `READ_PHONE_STATE`, and `POST_NOTIFICATIONS` on Android 13+) and accept the SMS-relay
+   consent notice, then save. The foreground service starts automatically once credentials
+   are saved.
+5. **A real SIM is required for actual SMS send/receive** — an emulator has no cellular radio,
+   so `SmsManager` calls will fail there with `NO_SIGNAL`/similar; use a physical device (or
+   at minimum a device image with emulated cellular via a real SIM-capable AVD config) to
+   exercise the SMS half end-to-end. The heartbeat/poll/HTTP half works fine on any
+   emulator with network access.
+6. **Command-line build** (from `android-gateway/`, with `ANDROID_HOME` set to a valid SDK,
+   or an `android-gateway/local.properties` with `sdk.dir=...`):
+   ```bash
+   ./gradlew assembleDebug   # -> app/build/outputs/apk/debug/app-debug.apk
+   ./gradlew lintDebug       # static analysis
+   ./gradlew testDebugUnitTest
+   ```
+
+### What was and wasn't verified by actually compiling (be honest about this)
+
+This project **was compiled for real** in the sandbox that built it — not just reviewed by
+eye. A full Android SDK (`cmdline-tools`, `platform-tools`, `platforms;android-34`,
+`build-tools;34.0.0`) was provisioned there specifically to prove this out, and:
+
+- `./gradlew assembleDebug` **succeeds**, producing a real, installable `app-debug.apk`.
+- `./gradlew lintDebug` **passes** (Android Lint's real static analysis — manifest checks,
+  resource checks, API-level checks — not just the Kotlin compiler) with zero errors and zero
+  warnings other than informational "a newer library version exists" notices for a few
+  intentionally-pinned dependency versions (see `app/build.gradle.kts`'s comments).
+- `./gradlew testDebugUnitTest` **passes** 4 real unit tests
+  (`app/src/test/kotlin/.../util/BackoffRetryTest.kt`) covering the retry/backoff logic.
+
+What this does **not** prove, and could not be verified in that sandbox (no device/emulator,
+no physical SIM):
+
+- The app has never actually been installed on a device or emulator, so no screen has been
+  visually confirmed to render correctly, no button has actually been tapped, and no runtime
+  crash (a `NullPointerException` on a real device's exact API level/OEM skin, a Compose
+  layout bug only visible at runtime, etc.) has been ruled out the way it would be by
+  `./gradlew installDebug` + manual exploration.
+- **No real SMS has ever actually been sent or received** — the `SmsManager`
+  divide/multipart/sent-intent logic and the `SMS_RECEIVED` receiver are correct against the
+  documented Android APIs to the best of this pass's knowledge, but neither has been exercised
+  against a real radio/SIM/carrier, which is where the genuinely carrier-specific edge cases
+  (a particular OEM's dual-SIM behavior, a particular carrier's segment reassembly quirks)
+  would actually surface.
+- **No real server was hit** — the HTTP client's request/response shapes were hand-matched
+  field-for-field against the Route Handler source (see each DTO/client method's doc comment
+  citing the exact file), not verified against a live deployment.
+
+A human opening this in Android Studio should expect: a project that syncs and builds without
+Gradle/dependency surprises (already proven), but should still budget normal
+first-real-device-test time for UI polish and the SMS-specific edge cases above.
