@@ -40,21 +40,32 @@
   }
 }
 
-* {
-  border-color: var(--border);
-}
+/*
+ * Wrapped in Tailwind's `base` layer (not left bare) so these resets rank *below* every
+ * `text-*`/`bg-*`/etc. utility class in CSS cascade-layer order. An unlayered rule always
+ * beats a layered one regardless of selector specificity — a bare top-level `a { color }`
+ * here silently overrode every `text-*` utility applied to a `<Link>`/`<a>` anywhere in the
+ * app (e.g. `(app)/nav.tsx`'s active-tab `text-accent-foreground`, which needs white text on
+ * an indigo `bg-accent` pill — with the override in place both colors resolved to the same
+ * `--accent` indigo, rendering the active nav label invisible in production).
+ */
+@layer base {
+  * {
+    border-color: var(--border);
+  }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: var(--font-sans);
-}
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+  }
 
-a {
-  color: var(--accent);
-}
+  a {
+    color: var(--accent);
+  }
 
-:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
 }
