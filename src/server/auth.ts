@@ -101,6 +101,14 @@ const adapter = {
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   adapter,
+  // Required for any deployment sitting behind a reverse proxy that terminates TLS
+  // (Railway, Vercel, Fly.io, Render, a Docker host behind nginx, ...) — Auth.js otherwise
+  // refuses to trust the `X-Forwarded-Host`/`Host` header the proxy sets, and every auth
+  // route (including /api/auth/csrf, which every sign-in attempt needs first) fails closed
+  // with a generic "There was a problem with the server configuration" error. This never
+  // surfaced in local development (no reverse proxy in front of `next dev`), only once
+  // actually deployed. See https://authjs.dev/reference/nextjs#trusthost.
+  trustHost: true,
   session: { strategy: "jwt", maxAge: SESSION_MAX_AGE_SECONDS },
   jwt: { maxAge: SESSION_MAX_AGE_SECONDS },
   pages: {
